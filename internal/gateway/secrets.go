@@ -33,6 +33,9 @@ func resolveCredential(a Auth, getenv func(string) string) (credential, error) {
 			if user == "" {
 				return credential{}, fmt.Errorf("environment variable %s is empty", a.UsernameEnv)
 			}
+			if strings.ContainsAny(user, ":\r\n\x00") {
+				return credential{}, fmt.Errorf("environment variable %s contains a colon or line break", a.UsernameEnv)
+			}
 		}
 		token := base64.StdEncoding.EncodeToString([]byte(user + ":" + secret))
 		return credential{auth: a, value: "Basic " + token}, nil
@@ -58,7 +61,7 @@ func readSecret(env, file string, getenv func(string) string) (string, error) {
 		}
 		v = strings.TrimRight(string(data), "\r\n")
 	}
-	if v == "" || strings.ContainsAny(v, "\r\n") {
+	if v == "" || strings.ContainsAny(v, "\r\n\x00") {
 		return "", errors.New("secret is empty or contains line breaks")
 	}
 	return v, nil
@@ -82,7 +85,7 @@ func (c credential) apply(r *http.Request) {
 func isProtectedHeader(h string) bool {
 	switch http.CanonicalHeaderKey(h) {
 	case "Authorization", "Proxy-Authorization", "Cookie", "Host", "Content-Length",
-		"Transfer-Encoding", "Connection", "Upgrade", "Te", "Trailer", "Keep-Alive":
+		"Transfer-Encoding", "Connection", "Upgrade", "Te", "Trailer", "Keep-Alive", "Proxy-Connection":
 		return true
 	}
 	return strings.HasPrefix(http.CanonicalHeaderKey(h), "X-Hootway-")

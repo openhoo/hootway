@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -291,5 +292,252 @@ func TestGenerateKey(t *testing.T) {
 	k, h, err := GenerateKey()
 	if err != nil || !strings.HasPrefix(k, KeyPrefix) || HashKey(k) != h || len(k) < 40 {
 		t.Fatalf("%q %q %v", k, h, err)
+	}
+}
+
+// referenceSplitRoute and referenceMatchPath are the original, simple
+// implementations. The optimised versions must agree with them exactly.
+func referenceSplitRoute(escaped string) (name, rest string, err error) {
+	lower := strings.ToLower(escaped)
+	for _, bad := range []string{"%2f", "%5c", "%2e", "%3b", "%00", "\\", "//", ";"} {
+		if strings.Contains(lower, bad) {
+			return "", "", errUnsafePath
+		}
+	}
+	if !strings.HasPrefix(escaped, "/") {
+		return "", "", errUnsafePath
+	}
+	name, rest, _ = strings.Cut(strings.TrimPrefix(escaped, "/"), "/")
+	rest = "/" + rest
+	for _, seg := range strings.Split(rest, "/") {
+		if seg == "." || seg == ".." {
+			return "", "", errUnsafePath
+		}
+	}
+	return name, rest, nil
+}
+
+func referenceMatchPath(pattern, path string) bool {
+	ps := strings.Split(strings.TrimPrefix(pattern, "/"), "/")
+	xs := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if len(xs) > 1 && xs[len(xs)-1] == "" {
+		xs = xs[:len(xs)-1]
+	}
+	for i, p := range ps {
+		if p == "**" {
+			return true
+		}
+		if i >= len(xs) || (p != "*" && p != xs[i]) || (p == "*" && xs[i] == "") {
+			return false
+		}
+	}
+	return len(xs) == len(ps)
+}
+
+var routeSamples = []string{
+	"", "/", "//", "/a", "/a/", "/a//b", "/jira/rest/api/3/issue/A-1", "/jira/.", "/jira/..", "/jira/./x",
+	"/jira/a/../b", "/jira/..a/b", "/jira/a..", "/jira/%2e%2e/x", "/jira/%2E/x", "/jira/%2F", "/jira/a%2fb",
+	"/jira/%5C", "/jira/%5c", "/jira/%00", "/jira/%0", "/jira/%2", "/jira/%", "/jira/%%2f", "/jira/%20x",
+	"/jira/a\\b", "/jira/..;/x", "/jira/a;b", "/jira/%3B", "jira/a", "/jira/%41", "/jira/%2g", "/jira/%3e", "/jira/%2d", "/jira/x/", "/.", "/..", "/a/.b",
+}
+
+func TestSplitRouteMatchesReference(t *testing.T) {
+	for _, p := range routeSamples {
+		n1, r1, e1 := splitRoute(p)
+		n2, r2, e2 := referenceSplitRoute(p)
+		if n1 != n2 || r1 != r2 || (e1 == nil) != (e2 == nil) {
+			t.Errorf("splitRoute(%q) = %q %q %v, reference %q %q %v", p, n1, r1, e1, n2, r2, e2)
+		}
+	}
+}
+
+func FuzzSplitRoute(f *testing.F) {
+	for _, p := range routeSamples {
+		f.Add(p)
+	}
+	f.Fuzz(func(t *testing.T, p string) {
+		n1, r1, e1 := splitRoute(p)
+		n2, r2, e2 := referenceSplitRoute(p)
+		if n1 != n2 || r1 != r2 || (e1 == nil) != (e2 == nil) {
+			t.Fatalf("splitRoute(%q) = %q %q %v, reference %q %q %v", p, n1, r1, e1, n2, r2, e2)
+		}
+	})
+}
+
+func TestMatchPathMatchesReference(t *testing.T) {
+	patterns := []string{"/", "/**", "/*", "/a", "/a/*", "/a/**", "/a/*/b", "/a/*/**", "/*/*", "/a/b/c"}
+	paths := []string{"/", "//", "/a", "/a/", "/a//", "/ab", "/a/b", "/a/b/", "/a/b/c", "/a/b/c/", "/a//b", "/x/b", "/a/x/b", "/a/x/b/c", ""}
+	for _, pat := range patterns {
+		for _, p := range paths {
+			if got, want := matchPath(pat, p), referenceMatchPath(pat, p); got != want {
+				t.Errorf("matchPath(%q,%q)=%v reference %v", pat, p, got, want)
+			}
+		}
+	}
+}
+
+func FuzzMatchPath(f *testing.F) {
+	f.Add("/a/*/**", "/a/b/c")
+	f.Add("/a/*", "/a/b/")
+	f.Fuzz(func(t *testing.T, pattern, path string) {
+		if validatePattern(pattern) != nil {
+			return
+		}
+		if got, want := matchPath(pattern, path), referenceMatchPath(pattern, path); got != want {
+			t.Fatalf("matchPath(%q,%q)=%v reference %v", pattern, path, got, want)
+		}
+	})
+}
+
+func TestErrorBodiesAreStable(t *testing.T) {
+	g, _ := testGateway(t, "http://127.0.0.1:1", nil)
+	rec := do(g, "GET", "/jira/rest/api/3/user", agentKey, nil)
+	want := `{"error":{"code":"forbidden","message":"this key is not allowed to call this upstream method and path"}}` + "\n"
+	if rec.Code != 403 || rec.Body.String() != want {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Content-Type") != "application/json" || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("headers %v", rec.Header())
+	}
+}
+
+func TestKeyLookupRejectsNearMisses(t *testing.T) {
+	g, _ := testGateway(t, "http://127.0.0.1:1", nil)
+	st := g.state.Load()
+	if st.lookupKey(agentKey) == nil {
+		t.Fatal("valid key not found")
+	}
+	for _, k := range []string{"", agentKey[:len(agentKey)-1], agentKey + "x", strings.ToUpper(agentKey), HashKey(agentKey)} {
+		if st.lookupKey(k) != nil {
+			t.Errorf("lookupKey(%q) matched", k)
+		}
+	}
+}
+
+func TestRateLimitSurvivesReloadAndRemovedKeysAreForgotten(t *testing.T) {
+	var got seen
+	up := newUpstream(t, &got)
+	g, _ := testGateway(t, up.URL, nil)
+	for i := 0; i < 3; i++ {
+		do(g, "GET", "/jira/rest/api/3/issue/A-1", agentKey, nil)
+	}
+	cfg, err := g.Config().clone()
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Apply(cfg)
+	if rec := do(g, "GET", "/jira/rest/api/3/issue/A-1", agentKey, nil); rec.Code != 429 {
+		t.Fatalf("window lost on reload: %d", rec.Code)
+	}
+	empty, _ := g.Config().clone()
+	empty.Keys = nil
+	g.Apply(empty)
+	g.limMu.Lock()
+	n := len(g.windows)
+	g.limMu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d stale rate limit windows", n)
+	}
+}
+
+func TestTransportIsSharedAcrossReloads(t *testing.T) {
+	g, _ := testGateway(t, "http://127.0.0.1:1", nil)
+	before := g.state.Load().upstreams["jira"].proxy.Transport
+	cfg, _ := g.Config().clone()
+	g.Apply(cfg)
+	after := g.state.Load().upstreams["jira"].proxy.Transport
+	if before != after || before == nil {
+		t.Fatal("transport recreated on reload")
+	}
+	cfg, _ = g.Config().clone()
+	cfg.Upstreams[0].TimeoutSeconds = 5
+	g.Apply(cfg)
+	if g.state.Load().upstreams["jira"].proxy.Transport == before {
+		t.Fatal("transport with a different timeout must not be shared")
+	}
+}
+
+func TestExplainAgreesWithEnforcement(t *testing.T) {
+	var got seen
+	up := newUpstream(t, &got)
+	g, _ := testGateway(t, up.URL, func(c *Config) { c.Keys[0].RequestsPerMinute = 0 })
+	for _, c := range []struct{ method, path string }{
+		{"GET", "/jira/rest/api/3/issue/A-1"}, {"GET", "/jira/rest/api/3/issue/A-1/"}, {"POST", "/jira/rest/api/3/issue/A-1/comment"},
+		{"DELETE", "/jira/rest/api/3/issue/A-1"}, {"GET", "/jira/rest/api/3/search"}, {"GET", "/jira/rest/api/3/user"},
+		{"GET", "/jira/a/../b"}, {"GET", "/nope/x"},
+	} {
+		d := g.Explain("agent", c.method, c.path)
+		rec := do(g, c.method, c.path, agentKey, nil)
+		if d.Allowed != (rec.Code == 200) {
+			t.Errorf("%s %s: explain allowed=%v, served %d", c.method, c.path, d.Allowed, rec.Code)
+		}
+		if d.Allowed && d.Grant == nil {
+			t.Errorf("%s %s: no grant reported", c.method, c.path)
+		}
+	}
+	if d := g.Explain("agent", "POST", "/jira/rest/api/3/issue/A-1/comment"); d.Grant == nil || d.Grant.Methods[0] != "POST" {
+		t.Fatalf("wrong grant reported: %+v", d.Grant)
+	}
+}
+
+func TestEventLogRing(t *testing.T) {
+	l := newEventLog(4)
+	if ev := l.since(0, 10); ev == nil || len(ev) != 0 {
+		t.Fatalf("empty log: %v", ev)
+	}
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 1; i <= 10; i++ {
+		outcome := "forwarded"
+		if i%2 == 0 {
+			outcome = "forbidden"
+		}
+		key := "a"
+		if i == 10 {
+			key = ""
+		}
+		l.add(Event{Key: key, Outcome: outcome, Time: t0.Add(time.Duration(i) * time.Second)})
+	}
+	seqs := func(evs []Event) string { return fmt.Sprint(len(evs), evs[0].Seq, evs[len(evs)-1].Seq) }
+	if got := seqs(l.since(0, 100)); got != "4 7 10" {
+		t.Fatalf("since(0): %s", got)
+	}
+	if got := seqs(l.since(8, 100)); got != "2 9 10" {
+		t.Fatalf("since(8): %s", got)
+	}
+	if got := seqs(l.since(0, 2)); got != "2 9 10" {
+		t.Fatalf("limit: %s", got)
+	}
+	if len(l.since(10, 5)) != 0 || len(l.since(99, 5)) != 0 || len(l.since(0, 0)) != 0 {
+		t.Fatal("expected no events")
+	}
+	stats, fwd, denied := l.snapshot()
+	a := stats["a"]
+	if fwd != 5 || denied != 5 || a.Forwarded != 5 || a.Denied != 4 || a.LastUsed == nil || !a.LastUsed.Equal(t0.Add(9*time.Second)) {
+		t.Fatalf("stats %+v fwd %d denied %d", a, fwd, denied)
+	}
+	if _, ok := stats[""]; ok {
+		t.Fatal("anonymous requests must not create key stats")
+	}
+}
+
+func TestAbortedProxyRequestIsRecorded(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "short")
+		if hj, ok := w.(http.Hijacker); ok {
+			c, _, _ := hj.Hijack()
+			_ = c.Close()
+		}
+	}))
+	t.Cleanup(up.Close)
+	g, _ := testGateway(t, up.URL, nil)
+	func() {
+		defer func() { _ = recover() }() // ReverseProxy aborts with http.ErrAbortHandler
+		do(g, "GET", "/jira/rest/api/3/issue/A-1", agentKey, nil)
+	}()
+	evs := g.events.since(0, 10)
+	if len(evs) != 1 || evs[0].Outcome != "forwarded" || evs[0].Key != "agent" {
+		t.Fatalf("events %+v", evs)
 	}
 }

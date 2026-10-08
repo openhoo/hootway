@@ -1,0 +1,7 @@
+# Allowlist: the image build needs only the Go module sources.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/
+internal/**/*_test.go

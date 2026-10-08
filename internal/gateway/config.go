@@ -167,6 +167,8 @@ func (c *Config) validate() error {
 		for h := range u.Headers {
 			if isProtectedHeader(h) {
 				errs = append(errs, fmt.Errorf("upstream %q: header %q cannot be set statically", u.Name, h))
+			} else if !validHeaderName(h) || strings.ContainsAny(u.Headers[h], "\r\n\x00") {
+				errs = append(errs, fmt.Errorf("upstream %q: header %q has an invalid name or value", u.Name, h))
 			}
 		}
 		if u.TimeoutSeconds < 0 {
@@ -230,6 +232,9 @@ func (a Auth) validate() error {
 		if a.Name == "" {
 			return fmt.Errorf("auth type %s requires name", a.Type)
 		}
+		if !validHeaderName(a.Name) {
+			return fmt.Errorf("auth name %q is not a valid token", a.Name)
+		}
 		if a.Type == "header" && isProtectedHeader(a.Name) && !strings.EqualFold(a.Name, "Authorization") {
 			return fmt.Errorf("auth header %q is not allowed", a.Name)
 		}
@@ -241,6 +246,9 @@ func (a Auth) validate() error {
 	}
 	if a.Type == "basic" && (a.Username == "") == (a.UsernameEnv == "") {
 		return errors.New("basic auth requires exactly one of username or username_env")
+	}
+	if strings.ContainsAny(a.Prefix+a.Username, "\r\n\x00") || strings.Contains(a.Username, ":") {
+		return errors.New("prefix and username must not contain line breaks, NUL or (username) colons")
 	}
 	return nil
 }
@@ -262,4 +270,20 @@ func validatePattern(p string) error {
 		}
 	}
 	return nil
+}
+
+// validHeaderName reports whether s is a non-empty RFC 9110 token, which is
+// also a safe query parameter name.
+func validHeaderName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0 {
+			continue
+		}
+		return false
+	}
+	return true
 }

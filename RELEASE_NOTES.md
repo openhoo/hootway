@@ -1,4 +1,29 @@
-First public release of Hootway: an API gateway that lets agent sandboxes call logged-in APIs such as Jira with scoped virtual keys instead of real credentials.
+Hootway lets agent sandboxes call logged-in APIs such as Jira with scoped virtual keys instead of real credentials.
+
+## Changes since 0.1.0
+
+### Security
+
+- Reject `;` and `%3B` in request paths: servlet upstreams such as Jira treat `..;` as `..`, which let a `/**` grant reach paths outside it
+- `query` auth: the injected secret is stripped from `Location`/`Content-Location` and `Refresh` is dropped, so redirects cannot echo it back
+- Console login/logout require the console header (login CSRF); upstream PUT rejects mismatched names
+- Configuration rejects CR/LF/NUL in static headers, prefixes and usernames, and invalid header or query names
+
+### Performance and footprint
+
+- Gateway hot paths about 51% faster (benchmark geomean), 80% less memory per forwarded request, allocation-free grant matching and path checks
+- Connection pools and rate-limit windows survive config reloads; activity polling is 46× cheaper
+- Smaller binaries (about −74 KB) with the console embedded precompressed and served with ETags (−69% on the wire)
+- Web console: focus handling, loading/error states, non-overlapping polling and accessibility fixes; screenshots 58% smaller
+
+### Packaging
+
+- Smaller container image: `scratch` with only the static binary, a CA bundle and a non-root user (UID/GID 65532); no shell, libc or tzdata
+- Release archives are compressed with `gzip -9`/`zip -9` and contain only the binary, `LICENSE`, `README.md` and example configs
+- CLI: exit status `2` for usage errors, `serve -h` help, listen-address errors reported before startup, a second `SIGINT`/`SIGTERM` skips the 15-second drain
+- CI: benchmark smoke run, docs-only changes skip CI, release image waits for verified binaries and is smoke-tested after signing
+
+## Highlights
 
 - Virtual keys (`hw_…`), stored only as SHA-256, with expiry, disable and per-minute limits
 - Per-key method and path grants; default deny, unsafe paths rejected before upstream

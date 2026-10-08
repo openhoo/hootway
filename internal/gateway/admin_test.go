@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -181,5 +182,58 @@ func TestConsoleServesUIWithSecurityHeaders(t *testing.T) {
 		if res.StatusCode != 200 || !strings.Contains(res.Header.Get("Content-Security-Policy"), "frame-ancestors 'none'") {
 			t.Fatalf("%s: %d %q", p, res.StatusCode, res.Header.Get("Content-Security-Policy"))
 		}
+	}
+}
+
+func TestConsoleAssetsCompressedAndRevalidated(t *testing.T) {
+	c, _, _ := newConsole(t, "http://127.0.0.1:1")
+	tr := &http.Transport{DisableCompression: true}
+	get := func(path string, hdr map[string]string) *http.Response {
+		req, _ := http.NewRequest("GET", c.srv.URL+path, nil)
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		res, err := tr.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+		return res
+	}
+	res := get("/app.js", map[string]string{"Accept-Encoding": "gzip, br"})
+	if res.Header.Get("Content-Encoding") != "gzip" || !strings.HasPrefix(res.Header.Get("Content-Type"), "text/javascript") || res.Header.Get("ETag") == "" {
+		t.Fatalf("headers: %v", res.Header)
+	}
+	if res := get("/app.js", nil); res.Header.Get("Content-Encoding") != "" {
+		t.Fatal("gzip without Accept-Encoding")
+	}
+	if res := get("/app.js", map[string]string{"If-None-Match": res.Header.Get("ETag")}); res.StatusCode != http.StatusNotModified {
+		t.Fatalf("revalidate: %d", res.StatusCode)
+	}
+	if res := get("/keys", nil); res.StatusCode != 200 || !strings.HasPrefix(res.Header.Get("Content-Type"), "text/html") {
+		t.Fatalf("spa fallback: %d %v", res.StatusCode, res.Header)
+	}
+}
+
+func TestEmbeddedConsoleAssetsMatchSources(t *testing.T) {
+	sources, _ := filepath.Glob("web/*.*")
+	n := 0
+	for _, src := range sources {
+		if strings.HasSuffix(src, ".gz") {
+			continue
+		}
+		n++
+		want, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := webAssets[filepath.Base(src)]
+		if a == nil || !bytes.Equal(a.raw, want) {
+			t.Errorf("%s: embedded asset is stale; run scripts/compress-web.sh", src)
+		}
+	}
+	if n == 0 || n != len(webAssets) {
+		t.Fatalf("%d sources, %d embedded assets", n, len(webAssets))
 	}
 }

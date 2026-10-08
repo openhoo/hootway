@@ -3,7 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore: ['docs/**', '**.md']
   pull_request:
+    paths-ignore: ['docs/**', '**.md']
   workflow_dispatch:
 
 permissions:
@@ -20,18 +22,26 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          # Standard library only: no go.sum, so key the build cache on go.mod.
+          cache-dependency-path: go.mod
       - name: Format
         run: test -z "$(gofmt -l .)"
       - name: Vet
         run: go vet ./...
       - name: Test
         run: go test -race -cover ./...
+      - name: Benchmark smoke
+        # Compiles and runs every benchmark briefly so they cannot rot; not a perf gate.
+        run: go test -run '^$' -bench . -benchtime 100x ./...
       - name: Validate example
         run: |
-          go build -o hootway ./cmd/hootway
+          go build -trimpath -ldflags='-s -w' -o hootway ./cmd/hootway
+          echo "linux/amd64 binary: $(wc -c < hootway) bytes" >> "$GITHUB_STEP_SUMMARY"
           key_hash=$(printf 'hw_ci' | ./hootway key hash)
           sed "s/replace-with-output-of-hootway-key-new-000000000000000000000000/$key_hash/" examples/jira.json > ci.json
           JIRA_EMAIL=ci@example.com JIRA_API_TOKEN=ci ./hootway check -config ci.json

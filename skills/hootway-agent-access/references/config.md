@@ -35,7 +35,7 @@
 
 Auth types: `basic` (username/username_env + secret), `bearer`, `header` (`name`, optional `prefix`), `query` (`name`), `none`.
 
-Exactly one of `secret_env` / `secret_file`. Unknown fields are rejected. Static headers cannot set `Authorization`, `Cookie`, `Host` or hop-by-hop headers.
+Exactly one of `secret_env` / `secret_file`. Unknown fields are rejected. Static headers cannot set `Authorization`, `Proxy-Authorization`, `Cookie`, `Host`, `Content-Length`, `X-Hootway-*` or hop-by-hop headers. `timeout_seconds` (default 60) bounds the upstream response header wait; `requests_per_minute` `0` means unlimited.
 
 Requests: `<listen>/<upstream name><upstream path>`; `GET /healthz` is unauthenticated.
 

@@ -36,7 +36,7 @@
       <a href="#check" data-tab="check">Check</a>
     </nav>
     <div class="top-actions">
-      <button id="theme" class="ghost icon" type="button" aria-label="Toggle theme" title="Toggle theme"><span aria-hidden="true">◐</span></button>
+      <button id="theme" class="ghost icon" type="button" aria-label="Switch theme" title="Switch theme"><span aria-hidden="true">◐</span></button>
       <button id="logout" class="ghost" type="button">Sign out</button>
     </div>
   </header>
@@ -44,7 +44,7 @@
   <main id="main" tabindex="-1">
     <div id="banner" class="banner" role="status" hidden></div>
 
-    <section id="tab-keys" class="tab" aria-labelledby="h-keys">
+    <section id="tab-keys" aria-labelledby="h-keys">
       <div class="head">
         <div>
           <h2 id="h-keys">Keys</h2>
@@ -53,10 +53,10 @@
         <button id="new-key" class="primary" type="button">New key</button>
       </div>
       <dl class="stats" id="stats"></dl>
-      <div id="keys" class="list" aria-live="polite"></div>
+      <div id="keys" class="list"></div>
     </section>
 
-    <section id="tab-upstreams" class="tab" aria-labelledby="h-up" hidden>
+    <section id="tab-upstreams" aria-labelledby="h-up" hidden>
       <div class="head">
         <div>
           <h2 id="h-up">Upstreams</h2>
@@ -67,14 +67,14 @@
       <div id="upstreams" class="list"></div>
     </section>
 
-    <section id="tab-activity" class="tab" aria-labelledby="h-act" hidden>
+    <section id="tab-activity" aria-labelledby="h-act" hidden>
       <div class="head">
         <div>
           <h2 id="h-act">Activity</h2>
           <p class="quiet">Recent requests since the gateway started. No secrets, query strings or bodies are recorded.</p>
         </div>
         <label class="field inline">
-          <span class="sr">Filter</span>
+          <span class="sr">Show</span>
           <select id="activity-filter">
             <option value="">All</option>
             <option value="forwarded">Forwarded</option>
@@ -82,17 +82,17 @@
           </select>
         </label>
       </div>
-      <div id="activity" class="log" aria-live="off"></div>
+      <div id="activity" class="log"></div>
     </section>
 
-    <section id="tab-check" class="tab" aria-labelledby="h-check" hidden>
+    <section id="tab-check" aria-labelledby="h-check" hidden>
       <div class="head">
         <div>
           <h2 id="h-check">Check</h2>
           <p class="quiet">Ask what the gateway would do with a request. Nothing is sent upstream.</p>
         </div>
       </div>
-      <form id="check-form" class="card narrow">
+      <form id="check-form" class="card narrow" novalidate>
         <label class="field"><span>Key</span><select id="check-key" required></select></label>
         <div class="row">
           <label class="field method"><span>Method</span>
@@ -119,7 +119,7 @@
       <label class="field grow"><span>Expires <em>optional</em></span><input id="key-expires" type="datetime-local"></label>
       <label class="field grow"><span>Requests per minute</span><input id="key-rpm" type="number" min="0" step="1" value="0" inputmode="numeric"><small class="quiet">0 is unlimited.</small></label>
     </div>
-    <fieldset class="grants">
+    <fieldset>
       <legend>Access</legend>
       <div id="grant-rows"></div>
       <button id="add-grant" class="ghost" type="button">Add access rule</button>
@@ -200,6 +200,6 @@
   </div>
 </dialog>
 
-<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<div id="toast" class="toast" role="status"></div>
 </body>
 </html>
