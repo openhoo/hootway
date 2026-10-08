@@ -8,6 +8,6 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}"
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/hootway /hootway
-EXPOSE 8787
+EXPOSE 8787 8788
 ENTRYPOINT ["/hootway"]
 CMD ["serve", "-config", "/etc/hootway/hootway.json", "-listen", "0.0.0.0:8787"]

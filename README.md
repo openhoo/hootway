@@ -43,11 +43,51 @@ Tools that only support e-mail + API token basic auth also work: Hootway
 accepts the virtual key as the basic-auth password and ignores the username.
 `X-Hootway-Key: hw_…` is a third option.
 
+## Web console
+
+![Keys](docs/screenshots/keys.png)
+
+A calm, built-in console for keys, upstreams, live activity and policy checks.
+It runs on a **separate listener** so an agent that can reach the gateway
+cannot reach the console.
+
+```sh
+hootway admin token                 # prints an hwa_… token and its sha256
+export HOOTWAY_ADMIN_TOKEN=hwa_…    # or put the sha256 into admin.token_sha256
+hootway serve -config hootway.json -admin-listen 127.0.0.1:8788
+```
+
+Open <http://127.0.0.1:8788> and sign in with the token.
+
+- **Keys** — create, edit, disable, rotate or delete keys and their access
+  rules. A new or rotated key is shown once, with a copyable sandbox snippet;
+  only its hash is saved.
+- **Upstreams** — base URL, credential type and where the secret comes from
+  (environment variable or file). Secrets are never typed into the console;
+  upstreams whose secret is missing are flagged and answer `503` until fixed.
+- **Activity** — the last 1,000 requests with key, method, path and outcome.
+  No query strings, bodies or credentials are recorded.
+- **Check** — asks the active policy whether a key may call a method and path,
+  without contacting the upstream.
+
+Changes are validated, written atomically to the config file and applied
+without a restart. Light and dark themes follow the system and can be toggled.
+
+| Activity (dark) | Mobile |
+| --- | --- |
+| ![Activity](docs/screenshots/activity-dark.png) | ![Mobile](docs/screenshots/mobile-dark.png) |
+
+Keep the console on localhost or behind your own TLS and access control. The
+admin API is also scriptable with `Authorization: Bearer hwa_…` and the
+`X-Hootway-Console: 1` header for writes.
+
 ## Configuration
 
 | Field | Meaning |
 | --- | --- |
 | `listen` | Address, default `127.0.0.1:8787`. |
+| `admin.listen` | Console address, default `127.0.0.1:8788`. Must differ from `listen`. |
+| `admin.token_sha256` | SHA-256 of the console token (or set `HOOTWAY_ADMIN_TOKEN`). |
 | `upstreams[].name` | Route prefix: `/<name>/…` forwards to this upstream. |
 | `upstreams[].base_url` | Upstream origin and optional base path. |
 | `upstreams[].auth.type` | `basic`, `bearer`, `header`, `query` or `none`. |
@@ -55,6 +95,7 @@ accepts the virtual key as the basic-auth password and ignores the username.
 | `upstreams[].auth.username` / `username_env` | Basic-auth user (Jira: account e-mail). |
 | `upstreams[].auth.name`, `prefix` | Header or query name; optional value prefix for `header`. |
 | `upstreams[].headers` | Fixed extra headers. Auth, cookie and hop-by-hop headers are refused. |
+| `upstreams[].description`, `keys[].description` | Optional notes shown in the console. |
 | `keys[].sha256` | SHA-256 of the virtual key. Plain keys are never stored. |
 | `keys[].expires_at`, `disabled` | Expiry (RFC 3339) and immediate revocation. |
 | `keys[].requests_per_minute` | Per-key limit, `0` = unlimited. |
@@ -86,8 +127,17 @@ unknown fields, unknown upstreams and malformed grants fail `hootway check`.
 
 ```sh
 docker build -t hootway .
-docker run --rm -p 8787:8787 -v $PWD/hootway.json:/etc/hootway/hootway.json:ro \
-  -e JIRA_EMAIL -e JIRA_API_TOKEN hootway
+docker run --rm -p 8787:8787 -p 127.0.0.1:8788:8788 \
+  -v $PWD/config:/etc/hootway \
+  -e JIRA_EMAIL -e JIRA_API_TOKEN -e HOOTWAY_ADMIN_TOKEN hootway \
+  serve -config /etc/hootway/hootway.json -listen 0.0.0.0:8787 -admin-listen 0.0.0.0:8788
+```
+
+Mount the config directory writable if you want console changes to persist
+(the file is replaced atomically). Publish the console port only on localhost
+or an internal network.
+
+```sh
 ```
 
 `GET /healthz` returns `{"status":"ok"}` without authentication.

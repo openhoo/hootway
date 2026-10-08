@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,25 +25,37 @@ import (
 const KeyPrefix = "hw_"
 
 // Gateway is an http.Handler that authenticates virtual keys, enforces grants
-// and forwards permitted requests with the real upstream credential.
+// and forwards permitted requests with the real upstream credential. Its
+// configuration can be replaced atomically while serving.
 type Gateway struct {
-	upstreams map[string]*route
-	keys      map[string]*keyState // by sha256 hex
+	state     atomic.Pointer[runtimeState]
 	log       *slog.Logger
 	now       func() time.Time
+	getenv    func(string) string
+	transport http.RoundTripper
+	events    *eventLog
+
+	limMu   sync.Mutex
+	windows map[string]*window // by key id, survives reloads
+}
+
+type runtimeState struct {
+	cfg       *Config
+	upstreams map[string]*route
+	keys      map[string]*Key // by sha256 hex
+	problems  map[string]string
 }
 
 type route struct {
 	up    Upstream
 	cred  credential
+	err   error
 	proxy *httputil.ReverseProxy
 }
 
-type keyState struct {
-	Key
-	mu          sync.Mutex
-	windowStart time.Time
-	count       int
+type window struct {
+	start time.Time
+	count int
 }
 
 // Options customise a Gateway; all fields are optional.
@@ -50,6 +64,9 @@ type Options struct {
 	Getenv    func(string) string
 	Transport http.RoundTripper
 	Now       func() time.Time
+	// Lenient lets the gateway start while some upstream credentials cannot
+	// be resolved; those upstreams answer 503 until fixed.
+	Lenient bool
 }
 
 // New resolves all upstream credentials and builds a Gateway.
@@ -63,18 +80,50 @@ func New(cfg *Config, opts Options) (*Gateway, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	g := &Gateway{upstreams: map[string]*route{}, keys: map[string]*keyState{}, log: opts.Logger, now: opts.Now}
-	for _, up := range cfg.Upstreams {
-		cred, err := resolveCredential(up.Auth, opts.Getenv)
-		if err != nil {
-			return nil, fmt.Errorf("upstream %q: %w", up.Name, err)
+	g := &Gateway{log: opts.Logger, now: opts.Now, getenv: opts.Getenv, transport: opts.Transport,
+		events: newEventLog(1000), windows: map[string]*window{}}
+	st := g.build(cfg)
+	if len(st.problems) > 0 && !opts.Lenient {
+		var errs []error
+		for name, p := range st.problems {
+			errs = append(errs, fmt.Errorf("upstream %q: %s", name, p))
 		}
-		r := &route{up: up, cred: cred}
+		return nil, errors.Join(errs...)
+	}
+	for name, p := range st.problems {
+		opts.Logger.Warn("upstream credential unavailable", "upstream", name, "problem", p)
+	}
+	g.state.Store(st)
+	return g, nil
+}
+
+// Apply atomically replaces the active configuration and returns credential
+// problems, keyed by upstream name.
+func (g *Gateway) Apply(cfg *Config) map[string]string {
+	st := g.build(cfg)
+	g.state.Store(st)
+	return st.problems
+}
+
+// Config returns the active configuration. Callers must not modify it.
+func (g *Gateway) Config() *Config { return g.state.Load().cfg }
+
+// Problems returns credential problems of the active configuration.
+func (g *Gateway) Problems() map[string]string { return g.state.Load().problems }
+
+func (g *Gateway) build(cfg *Config) *runtimeState {
+	st := &runtimeState{cfg: cfg, upstreams: map[string]*route{}, keys: map[string]*Key{}, problems: map[string]string{}}
+	for _, up := range cfg.Upstreams {
+		r := &route{up: up}
+		r.cred, r.err = resolveCredential(up.Auth, g.getenv)
+		if r.err != nil {
+			st.problems[up.Name] = r.err.Error()
+		}
 		timeout := time.Duration(up.TimeoutSeconds) * time.Second
 		if timeout == 0 {
 			timeout = 60 * time.Second
 		}
-		transport := opts.Transport
+		transport := g.transport
 		if transport == nil {
 			transport = &http.Transport{
 				Proxy:                 http.ProxyFromEnvironment,
@@ -86,21 +135,24 @@ func New(cfg *Config, opts Options) (*Gateway, error) {
 				ForceAttemptHTTP2:     true,
 			}
 		}
+		name := up.Name
 		r.proxy = &httputil.ReverseProxy{
 			Rewrite:        r.rewrite,
 			Transport:      transport,
 			ModifyResponse: r.modifyResponse,
 			ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
-				opts.Logger.Warn("upstream error", "upstream", up.Name, "error", err.Error())
+				g.log.Warn("upstream error", "upstream", name, "error", err.Error())
+				infoFrom(req.Context()).outcome = "upstream_error"
 				writeError(w, http.StatusBadGateway, "upstream_unreachable", "the upstream request failed")
 			},
 		}
-		g.upstreams[up.Name] = r
+		st.upstreams[up.Name] = r
 	}
-	for _, k := range cfg.Keys {
-		g.keys[k.SHA256] = &keyState{Key: k}
+	for i := range cfg.Keys {
+		k := &cfg.Keys[i]
+		st.keys[k.SHA256] = k
 	}
-	return g, nil
+	return st
 }
 
 // HashKey returns the configuration hash for a virtual key.
@@ -111,18 +163,23 @@ func HashKey(key string) string {
 
 // GenerateKey returns a new random virtual key and its hash.
 func GenerateKey() (key, hash string, err error) {
+	return generate(KeyPrefix)
+}
+
+func generate(prefix string) (key, hash string, err error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return "", "", err
 	}
-	key = KeyPrefix + base64.RawURLEncoding.EncodeToString(buf)
+	key = prefix + base64.RawURLEncoding.EncodeToString(buf)
 	return key, HashKey(key), nil
 }
 
 type ctxKey struct{}
 
 type requestInfo struct {
-	rest string
+	rest    string
+	outcome string
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -132,56 +189,116 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 		return
 	}
+	st := g.state.Load()
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-	keyID, upstream, outcome := "", "", ""
+	info := &requestInfo{}
+	ev := Event{Method: r.Method, Path: r.URL.EscapedPath()}
 	defer func() {
-		g.log.Info("request", "key", keyID, "upstream", upstream, "method", r.Method,
-			"path", r.URL.EscapedPath(), "status", rec.status, "outcome", outcome,
-			"duration_ms", g.now().Sub(start).Milliseconds())
+		ev.Time = start
+		ev.Status = rec.status
+		ev.Outcome = info.outcome
+		ev.DurationMS = g.now().Sub(start).Milliseconds()
+		g.events.add(ev)
+		g.log.Info("request", "key", ev.Key, "upstream", ev.Upstream, "method", ev.Method,
+			"path", ev.Path, "status", ev.Status, "outcome", ev.Outcome, "duration_ms", ev.DurationMS)
 	}()
 
 	presented := extractKey(r)
 	if presented == "" {
-		outcome = "missing_key"
+		info.outcome = "missing_key"
 		rec.Header().Set("WWW-Authenticate", `Bearer realm="hootway"`)
 		writeError(rec, http.StatusUnauthorized, "missing_key", "a Hootway virtual key is required")
 		return
 	}
-	ks := g.keys[HashKey(presented)]
-	if ks == nil || ks.Disabled || (ks.ExpiresAt != nil && !g.now().Before(*ks.ExpiresAt)) {
-		outcome = "invalid_key"
+	k := st.keys[HashKey(presented)]
+	if k == nil || k.Disabled || (k.ExpiresAt != nil && !g.now().Before(*k.ExpiresAt)) {
+		info.outcome = "invalid_key"
+		if k != nil {
+			ev.Key = k.ID
+		}
 		rec.Header().Set("WWW-Authenticate", `Bearer realm="hootway", error="invalid_token"`)
 		writeError(rec, http.StatusUnauthorized, "invalid_key", "the virtual key is unknown, disabled or expired")
 		return
 	}
-	keyID = ks.ID
+	ev.Key = k.ID
 
 	name, rest, err := splitRoute(r.URL.EscapedPath())
 	if err != nil {
-		outcome = "bad_path"
+		info.outcome = "bad_path"
 		writeError(rec, http.StatusBadRequest, "bad_path", "the request path contains disallowed encodings or dot segments")
 		return
 	}
-	upstream = name
-	rt := g.upstreams[name]
-	if rt == nil || !ks.allows(name, r.Method, rest) {
-		outcome = "forbidden"
+	ev.Upstream = name
+	rt := st.upstreams[name]
+	if rt == nil || !keyAllows(k, name, r.Method, rest) {
+		info.outcome = "forbidden"
 		writeError(rec, http.StatusForbidden, "forbidden", "this key is not allowed to call this upstream method and path")
 		return
 	}
-	if !ks.take(g.now()) {
-		outcome = "rate_limited"
+	if !g.take(k, g.now()) {
+		info.outcome = "rate_limited"
 		rec.Header().Set("Retry-After", "60")
 		writeError(rec, http.StatusTooManyRequests, "rate_limited", "the key's request rate limit is exhausted")
 		return
 	}
-	outcome = "forwarded"
-	ctx := r.Context()
-	r = r.WithContext(contextWith(ctx, &requestInfo{rest: rest}))
-	rt.proxy.ServeHTTP(rec, r)
+	if rt.err != nil {
+		info.outcome = "upstream_unconfigured"
+		writeError(rec, http.StatusServiceUnavailable, "upstream_unconfigured", "the gateway has no usable credential for this upstream")
+		return
+	}
+	info.outcome = "forwarded"
+	info.rest = rest
+	rt.proxy.ServeHTTP(rec, r.WithContext(contextWith(r.Context(), info)))
 }
 
-func (k *keyState) allows(upstream, method, path string) bool {
+// Decision explains whether a key may call a method and path.
+type Decision struct {
+	Allowed bool   `json:"allowed"`
+	Outcome string `json:"outcome"`
+	Reason  string `json:"reason"`
+	Grant   *Grant `json:"grant,omitempty"`
+}
+
+// Explain evaluates the active policy without contacting any upstream.
+func (g *Gateway) Explain(keyID, method, path string) Decision {
+	st := g.state.Load()
+	var k *Key
+	for _, c := range st.keys {
+		if c.ID == keyID {
+			k = c
+		}
+	}
+	switch {
+	case k == nil:
+		return Decision{Outcome: "invalid_key", Reason: "no key with this id"}
+	case k.Disabled:
+		return Decision{Outcome: "invalid_key", Reason: "the key is disabled"}
+	case k.ExpiresAt != nil && !g.now().Before(*k.ExpiresAt):
+		return Decision{Outcome: "invalid_key", Reason: "the key has expired"}
+	}
+	if u, err := url.Parse(path); err == nil && u.RawQuery != "" {
+		path = u.EscapedPath()
+	}
+	name, rest, err := splitRoute(path)
+	if err != nil {
+		return Decision{Outcome: "bad_path", Reason: "the path contains dot segments, // or encoded separators"}
+	}
+	rt := st.upstreams[name]
+	if rt == nil {
+		return Decision{Outcome: "forbidden", Reason: fmt.Sprintf("there is no upstream named %q", name)}
+	}
+	for i, gr := range k.Grants {
+		if gr.Upstream == name && gr.allows(method, rest) {
+			if rt.err != nil {
+				return Decision{Outcome: "upstream_unconfigured", Reason: "allowed, but the upstream credential is unavailable: " + rt.err.Error(), Grant: &k.Grants[i]}
+			}
+			return Decision{Allowed: true, Outcome: "forwarded", Reason: fmt.Sprintf("allowed and forwarded to %s%s", rt.up.base.String(), rest), Grant: &k.Grants[i]}
+		}
+	}
+	return Decision{Outcome: "forbidden", Reason: fmt.Sprintf("no grant allows %s %s on %s", method, rest, name)}
+}
+
+func keyAllows(k *Key, upstream, method, path string) bool {
 	for _, gr := range k.Grants {
 		if gr.Upstream == upstream && gr.allows(method, path) {
 			return true
@@ -190,19 +307,24 @@ func (k *keyState) allows(upstream, method, path string) bool {
 	return false
 }
 
-func (k *keyState) take(now time.Time) bool {
+func (g *Gateway) take(k *Key, now time.Time) bool {
 	if k.RequestsPerMinute == 0 {
 		return true
 	}
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if now.Sub(k.windowStart) >= time.Minute {
-		k.windowStart, k.count = now, 0
+	g.limMu.Lock()
+	defer g.limMu.Unlock()
+	w := g.windows[k.ID]
+	if w == nil {
+		w = &window{}
+		g.windows[k.ID] = w
 	}
-	if k.count >= k.RequestsPerMinute {
+	if now.Sub(w.start) >= time.Minute {
+		w.start, w.count = now, 0
+	}
+	if w.count >= k.RequestsPerMinute {
 		return false
 	}
-	k.count++
+	w.count++
 	return true
 }
 

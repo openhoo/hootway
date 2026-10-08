@@ -2,6 +2,7 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,16 +18,27 @@ import (
 // variables or files, and keys are stored as SHA-256 hashes.
 type Config struct {
 	Listen    string     `json:"listen"`
+	Admin     *Admin     `json:"admin,omitempty"`
 	Upstreams []Upstream `json:"upstreams"`
 	Keys      []Key      `json:"keys"`
+}
+
+// Admin configures the web console and admin API. It is served on its own
+// listener so agent sandboxes that can reach the gateway cannot reach it.
+type Admin struct {
+	Listen string `json:"listen,omitempty"`
+	// TokenSHA256 is the SHA-256 of the admin token. HOOTWAY_ADMIN_TOKEN may
+	// supply the token instead.
+	TokenSHA256 string `json:"token_sha256,omitempty"`
 }
 
 // Upstream is an API that Hootway can call on behalf of agents.
 type Upstream struct {
 	// Name is the route prefix: requests to /<name>/... go to this upstream.
-	Name    string `json:"name"`
-	BaseURL string `json:"base_url"`
-	Auth    Auth   `json:"auth"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	BaseURL     string `json:"base_url"`
+	Auth        Auth   `json:"auth"`
 	// Headers are additional fixed headers set on every upstream request.
 	Headers map[string]string `json:"headers,omitempty"`
 	// TimeoutSeconds bounds a single upstream round trip. Default 60.
@@ -53,7 +65,8 @@ type Auth struct {
 
 // Key is a virtual key handed to an agent.
 type Key struct {
-	ID string `json:"id"`
+	ID          string `json:"id"`
+	Description string `json:"description,omitempty"`
 	// SHA256 is the lowercase hex SHA-256 of the full virtual key.
 	SHA256    string     `json:"sha256"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
@@ -86,7 +99,7 @@ func LoadConfig(path string) (*Config, error) {
 
 // ParseConfig parses and validates JSON configuration bytes.
 func ParseConfig(data []byte) (*Config, error) {
-	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	var cfg Config
 	if err := dec.Decode(&cfg); err != nil {
@@ -95,7 +108,19 @@ func ParseConfig(data []byte) (*Config, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	if dec.More() {
+		return nil, errors.New("parse config: trailing data")
+	}
 	return &cfg, nil
+}
+
+// clone returns a validated deep copy of the configuration.
+func (c *Config) clone() (*Config, error) {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	return ParseConfig(data)
 }
 
 func (c *Config) validate() error {
@@ -103,6 +128,20 @@ func (c *Config) validate() error {
 		c.Listen = "127.0.0.1:8787"
 	}
 	var errs []error
+	if c.Admin != nil {
+		if c.Admin.Listen == "" {
+			c.Admin.Listen = "127.0.0.1:8788"
+		}
+		if c.Admin.TokenSHA256 != "" && !hashPattern.MatchString(c.Admin.TokenSHA256) {
+			errs = append(errs, errors.New("admin: token_sha256 must be 64 lowercase hex characters"))
+		}
+	}
+	if c.Upstreams == nil {
+		c.Upstreams = []Upstream{}
+	}
+	if c.Keys == nil {
+		c.Keys = []Key{}
+	}
 	upstreams := map[string]bool{}
 	for i := range c.Upstreams {
 		u := &c.Upstreams[i]

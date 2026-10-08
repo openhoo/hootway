@@ -26,5 +26,6 @@ Hootway replaces a real API credential with a revocable virtual key (`hw_…`) a
 4. Grant the smallest set: read paths with `GET`, writes only on specific endpoints. `*` = one segment, final `/**` = subtree.
 5. `hootway check -config hootway.json`, then `hootway serve -config hootway.json`.
 6. Run Hootway outside the sandbox; allow the sandbox network to reach Hootway, not the upstream.
-7. Verify one allowed and one denied request with curl before handing over the key.
-8. Revoke with `"disabled": true` or `expires_at` and restart Hootway.
+7. Optional console: `hootway admin token`, then `HOOTWAY_ADMIN_TOKEN=hwa_… hootway serve -config hootway.json -admin-listen 127.0.0.1:8788`. Create/rotate keys, watch Activity and use Check to test a method and path without calling the upstream. Never expose the console to the sandbox network.
+8. Verify one allowed and one denied request with curl before handing over the key.
+9. Revoke in the console (Disable/Delete, applied immediately) or set `"disabled": true` / `expires_at` in the file and restart.
