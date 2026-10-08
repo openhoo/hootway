@@ -2,3 +2,6 @@
 /dist/
 *.local.json
 .env
+*.test
+*.prof
+*.pprof

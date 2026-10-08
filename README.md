@@ -27,7 +27,6 @@ config change, not a credential rotation.
 ## Quick start (Jira Cloud)
 
 ```sh
-
 hootway key new            # prints a hw_… key and its sha256
 cp examples/jira.json hootway.json
 # put the sha256 into keys[0].sha256 and set your Jira site in base_url
@@ -101,6 +100,7 @@ admin API is also scriptable with `Authorization: Bearer hwa_…` and the
 | `upstreams[].auth.username` / `username_env` | Basic-auth user (Jira: account e-mail). |
 | `upstreams[].auth.name`, `prefix` | Header or query name; optional value prefix for `header`. |
 | `upstreams[].headers` | Fixed extra headers. Auth, cookie and hop-by-hop headers are refused. |
+| `upstreams[].timeout_seconds` | Upstream response header timeout, default `60`. |
 | `upstreams[].description`, `keys[].description` | Optional notes shown in the console. |
 | `keys[].sha256` | SHA-256 of the virtual key. Plain keys are never stored. |
 | `keys[].expires_at`, `disabled` | Expiry (RFC 3339) and immediate revocation. |
@@ -114,8 +114,8 @@ unknown fields, unknown upstreams and malformed grants fail `hootway check`.
 ## Security model
 
 - Requests are denied unless a grant matches. Denials never reach the upstream.
-- Paths with `..`, `.` segments, `//`, backslashes or encoded `/`, `\`, `.` or NUL
-  are rejected so the policy and the upstream see the same path.
+- Paths with `..`, `.` segments, `//`, backslashes, semicolons (servlet path
+  parameters such as `..;`) or encoded `/`, `\`, `.`, `;` or NUL are rejected so the policy and the upstream see the same path.
 - Caller `Authorization`, `Cookie`, `Proxy-Authorization`, `X-Hootway-*` and
   `X-Forwarded-*` headers are stripped; agent-supplied query credentials are
   overwritten for `query` auth.
@@ -138,14 +138,60 @@ docker run --rm -p 8787:8787 -p 127.0.0.1:8788:8788 \
   serve -config /etc/hootway/hootway.json -listen 0.0.0.0:8787 -admin-listen 0.0.0.0:8788
 ```
 
-Mount the config directory writable if you want console changes to persist
-(the file is replaced atomically). Publish the console port only on localhost
-or an internal network.
+The image is `scratch` with only the static binary and a CA bundle, and runs
+as UID/GID `65532`. The config directory must be readable by that user; make it
+writable (e.g. `chown 65532:65532 config`) if console changes should persist,
+because the file is replaced atomically in the same directory. Publish the
+console port only on localhost or an internal network.
+
+`GET /healthz` returns `{"status":"ok"}` without authentication, for liveness
+probes. There is no shell in the image, so use an HTTP probe rather than an
+exec probe.
+
+## Command line
+
+| Command | Purpose |
+| --- | --- |
+| `hootway serve [-config FILE] [-listen ADDR] [-admin-listen ADDR]` | Run the gateway and, if configured, the console. |
+| `hootway check [-config FILE]` | Validate the config and resolve every secret, then exit. |
+| `hootway key new` / `hootway key hash` | Create a virtual key, or hash one read from stdin. |
+| `hootway admin token` | Create a console token and its hash. |
+| `hootway version` | Print version and commit. |
+
+`HOOTWAY_CONFIG` sets the default config path, `HOOTWAY_ADMIN_TOKEN` supplies
+the console token and `HOOTWAY_PUBLIC_URL` sets the gateway URL shown in console
+snippets. Exit status is `0` on success, `1` for configuration or runtime
+errors and `2` for usage errors. `SIGINT`/`SIGTERM` stop accepting connections
+and let in-flight requests finish for up to 15 seconds; a second signal stops
+immediately.
+
+## Performance & footprint
+
+Release binaries (`-s -w -trimpath`, standard library only):
+
+| Target | Binary | gzip -9 |
+| --- | ---: | ---: |
+| linux/amd64 | 7.7 MB | 3.2 MB |
+| linux/arm64 | 7.1 MB | 2.9 MB |
+| darwin/arm64 | 7.4 MB | 3.0 MB |
+| windows/amd64 | 8.0 MB | 3.3 MB |
+
+The container image (`scratch` + CA bundle) is about 6.9 MB uncompressed and
+2.8 MB compressed. The console is embedded precompressed (about 13.6 KB on the
+wire) and revalidated with ETags.
+
+Gateway work per request on an Apple M4 Max (`go test -bench`, loopback
+upstream included): a forwarded request takes about 37 µs and 8 KiB
+(13 µs under parallel load); a rejected request about 1.1 µs and 5 allocations
+without touching the upstream. Grant matching and path checks do not allocate.
+
+Reproduce with:
 
 ```sh
+scripts/footprint.sh                                    # binary sizes per target
+go test -run '^$' -bench . -benchmem ./internal/gateway # hot-path benchmarks
+scripts/compress-web.sh                                 # after editing internal/gateway/web
 ```
-
-`GET /healthz` returns `{"status":"ok"}` without authentication.
 
 ## Agent skills
 
@@ -158,7 +204,12 @@ or an internal network.
 
 ```sh
 gofmt -l . && go vet ./... && go test -race -cover ./...
+go test -run '^$' -bench . -benchtime 100x ./...   # benchmark smoke, as in CI
 ```
+
+Releases are cut by pushing a `vX.Y.Z` tag; CI builds reproducible archives
+(`scripts/build-release.sh`, needs GNU tar), signs them with Sigstore, attests
+them and publishes a multi-arch image.
 
 ## License
 

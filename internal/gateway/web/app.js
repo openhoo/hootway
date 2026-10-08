@@ -1,62 +1,67 @@
 "use strict";
 
 const $ = (s, el = document) => el.querySelector(s);
-const state = { data: null, editingKey: null, editingUpstream: null, lastSeq: 0, events: [], timer: null };
+const state = { data: null, editingKey: null, editingUpstream: null, lastSeq: 0, events: [], timer: null, shown: "" };
 
-// ---------- theme ----------
+// theme
 const root = document.documentElement;
-const storedTheme = localStorage.getItem("hootway-theme");
-if (storedTheme) root.dataset.theme = storedTheme;
+const isDark = () => (root.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")) === "dark";
+function labelTheme() { const l = `Switch to ${isDark() ? "light" : "dark"} theme`; $("#theme").ariaLabel = l; $("#theme").title = l; }
+root.dataset.theme = localStorage.getItem("hootway-theme") || "";
+labelTheme();
 $("#theme").addEventListener("click", () => {
-  const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
-  root.dataset.theme = dark ? "light" : "dark";
+  root.dataset.theme = isDark() ? "light" : "dark";
   localStorage.setItem("hootway-theme", root.dataset.theme);
+  labelTheme();
 });
 
-// ---------- api ----------
+// api
 async function api(method, path, body) {
   const res = await fetch("/api" + path, {
     method,
     headers: { "Content-Type": "application/json", "X-Hootway-Console": "1" },
     body: body === undefined ? undefined : JSON.stringify(body),
-    credentials: "same-origin",
   });
   let data = null;
   try { data = await res.json(); } catch { /* empty */ }
   if (res.status === 401 && path !== "/session") { showLogin(); throw new Error("Signed out"); }
-  if (!res.ok) throw new Error((data && data.error && data.error.message) || `Request failed (${res.status})`);
+  if (!res.ok) throw new Error(data?.error?.message || `Request failed (${res.status})`);
   return data;
 }
 
+// Builds DOM nodes; text is always inserted as text, never parsed as HTML.
 function el(tag, attrs = {}, ...children) {
   const n = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
-    if (v === undefined || v === null || v === false) continue;
+    if (v == null || v === false) continue;
     if (k === "class") n.className = v;
     else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
     else n.setAttribute(k, v === true ? "" : v);
   }
-  for (const c of children.flat()) if (c !== null && c !== undefined && c !== false) n.append(c);
+  n.append(...children.flat().filter((c) => c != null && c !== false));
   return n;
 }
 
 let toastTimer;
 function toast(msg) {
   const t = $("#toast");
-  t.textContent = msg; t.hidden = false;
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.hidden = true), 2600);
+  t.textContent = msg;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.textContent = ""), 2600);
 }
 
 function setError(sel, msg) { const e = $(sel); e.textContent = msg || ""; e.hidden = !msg; }
 
 async function busy(btn, fn) {
+  if (btn.disabled) return;
   btn.disabled = true;
   try { return await fn(); } finally { btn.disabled = false; }
 }
 
-// ---------- session ----------
+// session
 function showLogin() {
   stopPolling();
+  Object.assign(state, { data: null, lastSeq: 0, events: [], shown: "" });
+  for (const d of document.querySelectorAll("dialog[open]")) d.close();
   $("#app").hidden = true; $("#login").hidden = false;
   $("#login-token").focus();
 }
@@ -79,32 +84,43 @@ $("#login-form").addEventListener("submit", async (e) => {
 });
 $("#logout").addEventListener("click", async () => { await api("DELETE", "/session").catch(() => {}); showLogin(); });
 
-// ---------- routing ----------
+// routing
 const tabs = ["keys", "upstreams", "activity", "check"];
 function route() {
   const tab = tabs.includes(location.hash.slice(1)) ? location.hash.slice(1) : "keys";
   for (const t of tabs) {
     $("#tab-" + t).hidden = t !== tab;
-    const link = $(`nav a[data-tab="${t}"]`);
-    if (t === tab) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current");
+    $(`nav a[data-tab="${t}"]`).ariaCurrent = t === tab ? "page" : null;
   }
   document.title = `${tab[0].toUpperCase() + tab.slice(1)} · Hootway`;
   if (tab === "activity") startPolling(); else stopPolling();
 }
-addEventListener("hashchange", () => { route(); $("#main").focus({ preventScroll: true }); });
+addEventListener("hashchange", () => { if ($("#app").hidden) return; route(); $("#main").focus({ preventScroll: true }); });
 
-// ---------- data ----------
+// data
+const lists = () => [$("#keys"), $("#upstreams")];
 async function refresh() {
-  if (!state.data) $("#keys").replaceChildren(el("div", { class: "skeleton" }), el("div", { class: "skeleton" }));
+  if (!state.data) for (const l of lists()) l.replaceChildren(el("div", { class: "skeleton" }), el("div", { class: "skeleton" }));
+  for (const l of lists()) l.ariaBusy = "true";
   try {
     state.data = await api("GET", "/state");
     render();
   } catch (err) {
-    if (err.message !== "Signed out") {
-      $("#keys").replaceChildren(el("div", { class: "empty" }, el("p", {}, "Could not load the gateway state."), el("p", {}, err.message),
-        el("button", { class: "ghost", type: "button", onclick: refresh }, "Try again")));
-    }
-  }
+    if (err.message !== "Signed out" && !state.data) {
+      for (const l of lists()) l.replaceChildren(empty("Could not load the gateway state", err.message, "Try again", refresh, "ghost"));
+    } else if (err.message !== "Signed out") toast(err.message);
+  } finally { for (const l of lists()) l.ariaBusy = "false"; }
+}
+
+// Re-rendering a list replaces its buttons (and disabling a busy button drops
+// focus to <body>); put keyboard focus back on the same action.
+let lastFocus = "";
+document.addEventListener("focusin", (e) => { if (e.target.dataset.f) lastFocus = e.target.dataset.f; });
+function restoreFocus() {
+  const a = document.activeElement;
+  if (a !== document.body && a.isConnected) return;
+  const t = lastFocus && $(`[data-f="${CSS.escape(lastFocus)}"]`);
+  if (t) t.focus(); else if (!$("#app").hidden) $("#main").focus({ preventScroll: true });
 }
 
 function render() {
@@ -121,9 +137,12 @@ function render() {
     stat("Forwarded", d.totals.forwarded),
     stat("Denied", d.totals.denied),
   );
-  renderKeys(); renderUpstreams(); renderCheckKeys();
+  renderKeys(); renderUpstreams(); renderCheckKeys(); restoreFocus();
 }
 function stat(label, value) { return el("div", {}, el("dt", {}, label), el("dd", {}, String(value))); }
+const action = (label, f, fn, cls = "link") => el("button", { class: cls, type: "button", "data-f": f, onclick: fn }, label);
+const empty = (title, text, label, fn, cls = "primary") =>
+  el("div", { class: "empty" }, el("p", {}, title), el("p", {}, text), label && el("button", { class: cls, type: "button", onclick: fn }, label));
 
 function fmtDate(s) {
   if (!s) return "";
@@ -143,10 +162,9 @@ function renderKeys() {
   const d = state.data;
   if (!d.keys.length) {
     const can = d.upstreams.length > 0;
-    list.replaceChildren(el("div", { class: "empty" },
-      el("p", {}, "No keys yet"),
-      el("p", {}, can ? "Create a key and give it to an agent instead of a real API token." : "Add an upstream first, then create a key for it."),
-      el("button", { class: "primary", type: "button", onclick: () => (can ? openKey() : openUpstream()) }, can ? "New key" : "New upstream")));
+    list.replaceChildren(empty("No keys yet",
+      can ? "Create a key and give it to an agent instead of a real API token." : "Add an upstream first, then create a key for it.",
+      can ? "New key" : "New upstream", () => (can ? openKey() : openUpstream())));
     return;
   }
   list.replaceChildren(...d.keys.map((k) => {
@@ -156,11 +174,11 @@ function renderKeys() {
     return el("article", { class: "card" },
       el("div", { class: "item-head" },
         el("h3", {}, k.id), status, el("span", { class: "spacer" }),
-        el("button", { class: "link", type: "button", onclick: () => openKey(k) }, "Edit"),
-        el("button", { class: "link", type: "button", onclick: () => toggleKey(k) }, k.disabled ? "Enable" : "Disable"),
-        el("button", { class: "link", type: "button", onclick: () => rotateKey(k) }, "Rotate"),
-        el("button", { class: "link danger ghost", type: "button", onclick: () => deleteKey(k) }, "Delete")),
-      k.description ? el("p", { class: "quiet small", style: null }, k.description) : null,
+        action("Edit", "ke:" + k.id, () => openKey(k)),
+        action(k.disabled ? "Enable" : "Disable", "kt:" + k.id, (e) => toggleKey(k, e.currentTarget)),
+        action("Rotate", "kr:" + k.id, () => rotateKey(k)),
+        action("Delete", "kd:" + k.id, () => deleteKey(k), "link danger")),
+      k.description ? el("p", { class: "quiet small" }, k.description) : null,
       el("div", { class: "item-meta" },
         el("span", { class: "mono", title: "First characters of the key hash" }, "#" + k.fingerprint),
         el("span", {}, ago(k.stats.last_used)),
@@ -176,9 +194,8 @@ function renderUpstreams() {
   const list = $("#upstreams");
   const d = state.data;
   if (!d.upstreams.length) {
-    list.replaceChildren(el("div", { class: "empty" }, el("p", {}, "No upstreams yet"),
-      el("p", {}, "An upstream is an API such as Jira that the gateway calls with its own credential."),
-      el("button", { class: "primary", type: "button", onclick: () => openUpstream() }, "New upstream")));
+    list.replaceChildren(empty("No upstreams yet", "An upstream is an API such as Jira that the gateway calls with its own credential.",
+      "New upstream", () => openUpstream()));
     return;
   }
   list.replaceChildren(...d.upstreams.map((u) => {
@@ -189,13 +206,13 @@ function renderUpstreams() {
         el("h3", {}, "/" + u.name),
         u.problem ? el("span", { class: "pill bad", title: u.problem }, "credential missing") : el("span", { class: "pill" }, "ready"),
         el("span", { class: "spacer" }),
-        el("button", { class: "link", type: "button", onclick: () => openUpstream(u) }, "Edit")),
+        action("Edit", "ue:" + u.name, () => openUpstream(u))),
       u.description ? el("p", { class: "quiet small" }, u.description) : null,
       el("div", { class: "item-meta" },
         el("span", { class: "mono" }, u.base_url),
         el("span", {}, `${u.auth.type}${src ? " · " + src : ""}`),
         el("span", {}, `${users} key${users === 1 ? "" : "s"}`)),
-      u.problem ? el("p", { class: "error", style: null }, u.problem) : null);
+      u.problem ? el("p", { class: "error" }, u.problem) : null);
   }));
 }
 
@@ -203,17 +220,17 @@ function renderCheckKeys() {
   const sel = $("#check-key");
   const cur = sel.value;
   sel.replaceChildren(...state.data.keys.map((k) => el("option", { value: k.id }, k.id)));
-  if (cur) sel.value = cur;
+  if (state.data.keys.some((k) => k.id === cur)) sel.value = cur;
 }
 
-// ---------- keys ----------
+// keys
 function grantRow(g = { upstream: "", methods: ["GET"], paths: [] }) {
   const ups = state.data.upstreams.map((u) => u.name);
   const row = el("div", { class: "grant" },
     el("select", { "aria-label": "Upstream", class: "g-up" }, ...ups.map((n) => el("option", { value: n, selected: n === g.upstream }, n))),
     el("input", { "aria-label": "Methods", class: "g-methods", value: g.methods.join(" "), placeholder: "GET POST", spellcheck: "false" }),
     el("textarea", { "aria-label": "Paths, one per line", class: "g-paths", rows: Math.max(1, g.paths.length), placeholder: "/rest/api/3/issue/*", spellcheck: "false" }, g.paths.join("\n")),
-    el("button", { class: "link", type: "button", "aria-label": "Remove rule", onclick: () => row.remove() }, "✕"));
+    el("button", { class: "link", type: "button", "aria-label": "Remove rule", onclick: () => { row.remove(); $("#add-grant").focus(); } }, "✕"));
   return row;
 }
 
@@ -287,7 +304,7 @@ $("#key-form").addEventListener("submit", async (e) => {
 
 function showSecret(key, upstream) {
   $("#secret-value").textContent = key;
-  const base = (state.data.gateway_url || location.origin.replace(/:\d+$/, ":8787")) + "/" + (upstream || "jira");
+  const base = state.data.gateway_url + "/" + (upstream || "jira");
   $("#secret-snippet").textContent =
 `export HOOTWAY_URL=${base}
 export HOOTWAY_KEY=${key}
@@ -305,14 +322,16 @@ function keyBody(k, patch) {
   return { id: k.id, description: k.description || "", disabled: k.disabled, expires_at: k.expires_at || null,
     requests_per_minute: k.requests_per_minute, grants: k.grants, ...patch };
 }
-async function toggleKey(k) {
-  try { await api("PUT", "/keys/" + encodeURIComponent(k.id), keyBody(k, { disabled: !k.disabled })); toast(k.disabled ? "Key enabled" : "Key disabled"); await refresh(); }
-  catch (err) { toast(err.message); }
+function toggleKey(k, btn) {
+  return busy(btn, async () => {
+    try { await api("PUT", "/keys/" + encodeURIComponent(k.id), keyBody(k, { disabled: !k.disabled })); toast(k.disabled ? "Key enabled" : "Key disabled"); await refresh(); }
+    catch (err) { toast(err.message); }
+  });
 }
 function rotateKey(k) {
   confirmAction(`Rotate ${k.id}?`, "The current key stops working immediately. You will get a new key to give to the agent.", "Rotate", async () => {
     const res = await api("POST", `/keys/${encodeURIComponent(k.id)}/rotate`);
-    showSecret(res.key, k.grants[0]?.upstream); await refresh();
+    $("#confirm-dialog").close(); showSecret(res.key, k.grants[0]?.upstream); await refresh();
   });
 }
 function deleteKey(k) {
@@ -331,7 +350,7 @@ function confirmAction(title, text, label, fn) {
   dlg.querySelector("[data-close]").focus();
 }
 
-// ---------- upstreams ----------
+// upstreams
 function syncAuthFields() {
   const t = $("#up-auth").value;
   for (const n of document.querySelectorAll("#up-dialog [data-auth]")) n.hidden = !n.dataset.auth.split(" ").includes(t);
@@ -395,30 +414,36 @@ $("#up-delete").addEventListener("click", () => {
   });
 });
 
-// ---------- activity ----------
-function startPolling() { if (!state.timer) { pollEvents(); state.timer = setInterval(pollEvents, 3000); } }
-function stopPolling() { clearInterval(state.timer); state.timer = null; }
+// activity
+// One request in flight at a time; paused while the tab is hidden.
+function startPolling() { if (!state.timer) { state.timer = true; pollEvents(); } }
+function stopPolling() { clearTimeout(state.timer); state.timer = null; }
 async function pollEvents() {
-  try {
-    const { events } = await api("GET", "/events?after=" + state.lastSeq);
-    if (events.length) {
-      state.lastSeq = events[events.length - 1].seq;
-      state.events = state.events.concat(events).slice(-300);
-    }
-    renderEvents();
-  } catch { /* shown on next refresh */ }
+  if (!document.hidden) {
+    try {
+      const { events } = await api("GET", "/events?after=" + state.lastSeq);
+      if (events.length) {
+        state.lastSeq = events[events.length - 1].seq;
+        state.events = state.events.concat(events).slice(-300);
+      }
+      renderEvents();
+    } catch { /* signed out or offline; retried below */ }
+  }
+  if (state.timer) state.timer = setTimeout(pollEvents, 3000);
 }
-$("#activity-filter").addEventListener("change", renderEvents);
+$("#activity-filter").addEventListener("change", () => renderEvents());
 const outcomeText = {
   forwarded: "forwarded", forbidden: "not allowed", invalid_key: "invalid key", missing_key: "no key",
   bad_path: "unsafe path", rate_limited: "rate limited", upstream_error: "upstream failed", upstream_unconfigured: "no credential",
 };
 function renderEvents() {
   const f = $("#activity-filter").value;
+  if (state.shown === state.lastSeq + f) return;
+  state.shown = state.lastSeq + f;
   const list = state.events.filter((e) => !f || (f === "forwarded") === (e.outcome === "forwarded")).slice().reverse();
   const log = $("#activity");
   if (!list.length) {
-    log.replaceChildren(el("div", { class: "empty", style: null }, el("p", {}, "Quiet so far"), el("p", {}, "Requests from agents appear here as they happen.")));
+    log.replaceChildren(empty(f ? "Nothing matches this filter" : "Quiet so far", "Requests from agents appear here as they happen."));
     return;
   }
   log.replaceChildren(...list.slice(0, 200).map((e) => {
@@ -432,23 +457,31 @@ function renderEvents() {
   }));
 }
 
-// ---------- check ----------
-$("#check-form").addEventListener("submit", async (e) => {
+// check
+$("#check-form").addEventListener("submit", (e) => {
   e.preventDefault();
   const out = $("#check-result");
-  if (!$("#check-key").value) { out.className = "verdict no"; out.replaceChildren(el("strong", {}, "No keys"), "Create a key first."); out.hidden = false; return; }
-  try {
-    const r = await api("POST", "/explain", { key: $("#check-key").value, method: $("#check-method").value, path: $("#check-path").value });
-    out.className = "verdict " + (r.allowed ? "ok" : "no");
-    out.replaceChildren(el("strong", {}, r.allowed ? "Allowed" : "Denied"), r.reason);
-  } catch (err) { out.className = "verdict no"; out.replaceChildren(el("strong", {}, "Error"), err.message); }
-  out.hidden = false;
+  const verdict = (ok, title, text) => { out.className = "verdict " + (ok ? "ok" : "no"); out.replaceChildren(el("strong", {}, title), text); out.hidden = false; };
+  const path = $("#check-path").value.trim();
+  if (!$("#check-key").value) return verdict(false, "No keys", "Create a key first.");
+  if (!path) { $("#check-path").focus(); return verdict(false, "Missing path", "Enter a path such as /jira/rest/api/3/myself."); }
+  return busy(e.submitter || $("#check-form button"), async () => {
+    try {
+      const r = await api("POST", "/explain", { key: $("#check-key").value, method: $("#check-method").value, path });
+      verdict(r.allowed, r.allowed ? "Allowed" : "Denied", r.reason);
+    } catch (err) { verdict(false, "Error", err.message); }
+  });
 });
 
-// ---------- dialogs ----------
+// dialogs
 for (const b of document.querySelectorAll("[data-close]")) b.addEventListener("click", () => b.closest("dialog").close());
-for (const d of document.querySelectorAll("dialog")) d.addEventListener("click", (e) => { if (e.target === d && d.id !== "secret-dialog") d.close(); });
+for (const d of document.querySelectorAll("dialog")) {
+  let down = null;
+  d.addEventListener("pointerdown", (e) => (down = e.target));
+  d.addEventListener("click", (e) => { if (e.target === d && down === d && d.id !== "secret-dialog") d.close(); });
+  d.addEventListener("close", () => setTimeout(restoreFocus));
+}
 document.addEventListener("visibilitychange", () => { if (!document.hidden && !$("#app").hidden) refresh(); });
 
-// ---------- boot ----------
+// boot
 api("GET", "/session").then((s) => (s.authenticated ? showApp() : showLogin())).catch(showLogin);

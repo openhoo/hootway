@@ -1,8 +1,12 @@
 package gateway
 
 import (
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -17,7 +21,7 @@ import (
 	"time"
 )
 
-//go:embed web
+//go:embed web/*.gz
 var webFS embed.FS
 
 const sessionCookie = "hootway_admin"
@@ -54,19 +58,103 @@ func (a *AdminServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.api(w, r)
 		return
 	}
-	static, _ := fs.Sub(webFS, "web")
-	if r.URL.Path != "/" && !strings.Contains(r.URL.Path[1:], "/") {
-		if _, err := fs.Stat(static, r.URL.Path[1:]); err == nil {
-			http.FileServerFS(static).ServeHTTP(w, r)
-			return
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	asset, ok := webAssets[strings.TrimPrefix(r.URL.Path, "/")]
+	if !ok {
+		asset = webAssets["index.html"] // client-side routes
+	}
+	asset.serve(w, r)
+}
+
+// webAsset is an embedded console file. The sources in web/ are embedded
+// only as their gzip -9n form (scripts/compress-web.sh; a test keeps them in
+// sync), which keeps the gzip encoder out of the binary. Clients without
+// gzip support get the body decompressed once at startup.
+type webAsset struct {
+	typ, etag string
+	raw, gz   []byte
+}
+
+var webAssets = loadWebAssets()
+
+func loadWebAssets() map[string]*webAsset {
+	types := map[string]string{".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8"}
+	assets := map[string]*webAsset{}
+	entries, err := fs.ReadDir(webFS, "web")
+	if err != nil {
+		panic(err)
+	}
+	for _, e := range entries {
+		name, ok := strings.CutSuffix(e.Name(), ".gz")
+		if !ok || e.IsDir() {
+			continue
+		}
+		gz, err := fs.ReadFile(webFS, "web/"+e.Name())
+		if err != nil {
+			panic(err)
+		}
+		zr, err := gzip.NewReader(bytes.NewReader(gz))
+		if err != nil {
+			panic(err)
+		}
+		raw, err := io.ReadAll(zr)
+		if err != nil {
+			panic(err)
+		}
+		sum := sha256.Sum256(raw)
+		a := &webAsset{typ: types[filepath.Ext(name)], etag: `"` + hex.EncodeToString(sum[:8]) + `"`, raw: raw, gz: gz}
+		if a.typ == "" {
+			a.typ = "application/octet-stream"
+		}
+		assets[name] = a
+	}
+	return assets
+}
+
+func (a *webAsset) serve(w http.ResponseWriter, r *http.Request) {
+	h := w.Header()
+	h.Set("Content-Type", a.typ)
+	h.Set("Cache-Control", "no-cache")
+	h.Set("ETag", a.etag)
+	h.Set("Vary", "Accept-Encoding")
+	if inm := r.Header.Get("If-None-Match"); inm != "" && (inm == a.etag || strings.Contains(inm, a.etag)) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	body := a.raw
+	if a.gz != nil && acceptsGzip(r.Header.Get("Accept-Encoding")) {
+		h.Set("Content-Encoding", "gzip")
+		body = a.gz
+	}
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	if r.Method != http.MethodHead {
+		w.Write(body)
+	}
+}
+
+func acceptsGzip(ae string) bool {
+	for _, part := range strings.Split(ae, ",") {
+		name, q, _ := strings.Cut(strings.TrimSpace(part), ";")
+		if strings.EqualFold(strings.TrimSpace(name), "gzip") {
+			return strings.ReplaceAll(strings.TrimSpace(q), " ", "") != "q=0"
 		}
 	}
-	http.ServeFileFS(w, r, static, "index.html")
+	return false
 }
 
 func (a *AdminServer) api(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api")
 	if path == "/session" {
+		// Login and logout change state too: require the console header so a
+		// cross-site form cannot plant or end a session (login CSRF).
+		if r.Method != http.MethodGet && r.Header.Get("X-Hootway-Console") != "1" {
+			writeError(w, http.StatusForbidden, "csrf", "missing console header")
+			return
+		}
 		switch r.Method {
 		case http.MethodPost:
 			a.login(w, r)
@@ -137,13 +225,13 @@ func (a *AdminServer) api(w http.ResponseWriter, r *http.Request) {
 			if up.Name == "" {
 				up.Name = name
 			}
+			if up.Name != name {
+				return nil, errors.New("the body name must match the URL; renaming an upstream is not supported")
+			}
 			i := upstreamIndex(c, name)
 			if i < 0 {
 				c.Upstreams = append(c.Upstreams, up)
 				return up, nil
-			}
-			if up.Name != name {
-				return nil, errors.New("renaming an upstream is not supported; create a new one")
 			}
 			c.Upstreams[i] = up
 			return up, nil
@@ -347,7 +435,13 @@ func (a *AdminServer) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.sessMu.Lock()
-	a.sessions[HashKey(sid)] = time.Now().Add(12 * time.Hour)
+	now := time.Now()
+	for h, exp := range a.sessions { // bound memory: drop expired sessions
+		if now.After(exp) {
+			delete(a.sessions, h)
+		}
+	}
+	a.sessions[HashKey(sid)] = now.Add(12 * time.Hour)
 	a.sessMu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: sid, Path: "/", HttpOnly: true,
 		SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil, MaxAge: 12 * 3600})
