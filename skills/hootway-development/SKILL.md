@@ -14,6 +14,9 @@ Hootway is a security boundary between agent sandboxes and real API credentials.
 - `internal/gateway/match.go` — route splitting, unsafe-path rejection, grant matching.
 - `internal/gateway/secrets.go` — credential resolution/injection and protected headers.
 - `internal/gateway/server.go` — key auth, rate limit, reverse proxy, response sanitising, audit log.
+- `internal/gateway/admin.go` — console + admin API: token sessions, CSRF header, validate → persist atomically → apply.
+- `internal/gateway/events.go` — in-memory activity ring buffer and per-key stats.
+- `internal/gateway/web/` — embedded plain HTML/CSS/JS console (no build step).
 - `examples/jira.json` — reference configuration, validated in CI.
 
 ## Rules
@@ -33,5 +36,7 @@ key_hash=$(printf 'hw_ci' | /tmp/hootway key hash)
 sed "s/replace-with-output-of-hootway-key-new-000000000000000000000000/$key_hash/" examples/jira.json > /tmp/ci.json
 JIRA_EMAIL=ci@example.com JIRA_API_TOKEN=ci /tmp/hootway check -config /tmp/ci.json
 ```
+
+For console changes: `node --check internal/gateway/web/app.js`, run `HOOTWAY_ADMIN_TOKEN=hwa_demo hootway serve -config … -admin-listen 127.0.0.1:8788`, and check login, empty states, key create/rotate/delete, activity and check in light/dark and at 390px width. Refresh `docs/screenshots` when the UI changes.
 
 For proxy behaviour changes, also run `hootway serve` against a local test upstream and exercise allowed and denied requests with curl.

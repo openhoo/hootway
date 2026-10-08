@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Hootway</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='11' fill='none' stroke='%235b7a6a' stroke-width='3'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<section id="login" class="login" hidden>
+  <form id="login-form" class="login-card" novalidate>
+    <div class="mark" aria-hidden="true"></div>
+    <h1>Hootway</h1>
+    <p class="quiet">Sign in with the admin token.</p>
+    <label class="field">
+      <span>Admin token</span>
+      <input id="login-token" type="password" autocomplete="current-password" spellcheck="false" required>
+    </label>
+    <p id="login-error" class="error" role="alert" hidden></p>
+    <button class="primary wide" type="submit">Sign in</button>
+  </form>
+</section>
+
+<div id="app" hidden>
+  <header class="top">
+    <a class="brand" href="#keys"><span class="mark small" aria-hidden="true"></span>Hootway</a>
+    <nav aria-label="Sections">
+      <a href="#keys" data-tab="keys">Keys</a>
+      <a href="#upstreams" data-tab="upstreams">Upstreams</a>
+      <a href="#activity" data-tab="activity">Activity</a>
+      <a href="#check" data-tab="check">Check</a>
+    </nav>
+    <div class="top-actions">
+      <button id="theme" class="ghost icon" type="button" aria-label="Toggle theme" title="Toggle theme"><span aria-hidden="true">◐</span></button>
+      <button id="logout" class="ghost" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <div id="banner" class="banner" role="status" hidden></div>
+
+    <section id="tab-keys" class="tab" aria-labelledby="h-keys">
+      <div class="head">
+        <div>
+          <h2 id="h-keys">Keys</h2>
+          <p class="quiet">Virtual keys you hand to agents. The real credentials never leave the gateway.</p>
+        </div>
+        <button id="new-key" class="primary" type="button">New key</button>
+      </div>
+      <dl class="stats" id="stats"></dl>
+      <div id="keys" class="list" aria-live="polite"></div>
+    </section>
+
+    <section id="tab-upstreams" class="tab" aria-labelledby="h-up" hidden>
+      <div class="head">
+        <div>
+          <h2 id="h-up">Upstreams</h2>
+          <p class="quiet">APIs the gateway calls. Secrets come from environment variables or files on the gateway host.</p>
+        </div>
+        <button id="new-upstream" class="primary" type="button">New upstream</button>
+      </div>
+      <div id="upstreams" class="list"></div>
+    </section>
+
+    <section id="tab-activity" class="tab" aria-labelledby="h-act" hidden>
+      <div class="head">
+        <div>
+          <h2 id="h-act">Activity</h2>
+          <p class="quiet">Recent requests since the gateway started. No secrets, query strings or bodies are recorded.</p>
+        </div>
+        <label class="field inline">
+          <span class="sr">Filter</span>
+          <select id="activity-filter">
+            <option value="">All</option>
+            <option value="forwarded">Forwarded</option>
+            <option value="denied">Denied</option>
+          </select>
+        </label>
+      </div>
+      <div id="activity" class="log" aria-live="off"></div>
+    </section>
+
+    <section id="tab-check" class="tab" aria-labelledby="h-check" hidden>
+      <div class="head">
+        <div>
+          <h2 id="h-check">Check</h2>
+          <p class="quiet">Ask what the gateway would do with a request. Nothing is sent upstream.</p>
+        </div>
+      </div>
+      <form id="check-form" class="card narrow">
+        <label class="field"><span>Key</span><select id="check-key" required></select></label>
+        <div class="row">
+          <label class="field method"><span>Method</span>
+            <select id="check-method"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select>
+          </label>
+          <label class="field grow"><span>Path</span><input id="check-path" placeholder="/jira/rest/api/3/issue/ABC-1" spellcheck="false" required></label>
+        </div>
+        <button class="primary" type="submit">Check</button>
+        <div id="check-result" class="verdict" role="status" hidden></div>
+      </form>
+    </section>
+  </main>
+</div>
+
+<dialog id="key-dialog" aria-labelledby="key-dialog-title">
+  <form id="key-form" method="dialog" novalidate>
+    <h3 id="key-dialog-title">New key</h3>
+    <label class="field"><span>Name</span>
+      <input id="key-id" pattern="[a-z0-9][a-z0-9_\-]{0,62}" placeholder="triage-agent" spellcheck="false" required>
+      <small class="quiet">Lowercase letters, digits, - and _.</small>
+    </label>
+    <label class="field"><span>Description <em>optional</em></span><input id="key-desc" placeholder="Sandbox for nightly ticket triage"></label>
+    <div class="row">
+      <label class="field grow"><span>Expires <em>optional</em></span><input id="key-expires" type="datetime-local"></label>
+      <label class="field grow"><span>Requests per minute</span><input id="key-rpm" type="number" min="0" step="1" value="0" inputmode="numeric"><small class="quiet">0 is unlimited.</small></label>
+    </div>
+    <fieldset class="grants">
+      <legend>Access</legend>
+      <div id="grant-rows"></div>
+      <button id="add-grant" class="ghost" type="button">Add access rule</button>
+      <small class="quiet"><code>*</code> matches one path segment, a final <code>/**</code> everything below.</small>
+    </fieldset>
+    <label class="check"><input id="key-disabled" type="checkbox"> Disabled</label>
+    <p id="key-error" class="error" role="alert" hidden></p>
+    <div class="actions">
+      <button class="ghost" type="button" data-close>Cancel</button>
+      <button class="primary" type="submit" id="key-save">Create key</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="secret-dialog" aria-labelledby="secret-title">
+  <div class="secret-body">
+    <h3 id="secret-title">Key ready</h3>
+    <p class="quiet">Copy it now. Hootway keeps only a fingerprint and cannot show it again.</p>
+    <div class="secret"><code id="secret-value"></code><button id="copy-secret" class="ghost" type="button">Copy</button></div>
+    <p class="quiet small">In the agent sandbox:</p>
+    <pre id="secret-snippet" class="snippet"></pre>
+    <div class="actions"><button class="primary" type="button" data-close>Done</button></div>
+  </div>
+</dialog>
+
+<dialog id="up-dialog" aria-labelledby="up-title">
+  <form id="up-form" method="dialog" novalidate>
+    <h3 id="up-title">New upstream</h3>
+    <div class="row">
+      <label class="field grow"><span>Name</span><input id="up-name" placeholder="jira" spellcheck="false" required><small class="quiet">Agents call <code>/name/…</code></small></label>
+      <label class="field grow"><span>Timeout seconds</span><input id="up-timeout" type="number" min="0" value="60"></label>
+    </div>
+    <label class="field"><span>Base URL</span><input id="up-url" type="url" placeholder="https://your-site.atlassian.net" spellcheck="false" required></label>
+    <label class="field"><span>Description <em>optional</em></span><input id="up-desc"></label>
+    <fieldset>
+      <legend>Credential</legend>
+      <div class="row">
+        <label class="field grow"><span>Type</span>
+          <select id="up-auth">
+            <option value="basic">Basic (e-mail + API token)</option>
+            <option value="bearer">Bearer token</option>
+            <option value="header">Custom header</option>
+            <option value="query">Query parameter</option>
+            <option value="none">None</option>
+          </select>
+        </label>
+        <label class="field grow" data-auth="header query"><span>Header / parameter name</span><input id="up-auth-name" spellcheck="false"></label>
+        <label class="field grow" data-auth="header"><span>Value prefix <em>optional</em></span><input id="up-auth-prefix" placeholder="token " spellcheck="false"></label>
+      </div>
+      <div class="row" data-auth="basic">
+        <label class="field grow"><span>Username</span><input id="up-user" placeholder="bot@example.com" spellcheck="false"></label>
+        <label class="field grow"><span>or username env</span><input id="up-user-env" placeholder="JIRA_EMAIL" spellcheck="false"></label>
+      </div>
+      <div class="row" data-auth="basic bearer header query">
+        <label class="field grow"><span>Secret env variable</span><input id="up-secret-env" placeholder="JIRA_API_TOKEN" spellcheck="false"></label>
+        <label class="field grow"><span>or secret file</span><input id="up-secret-file" placeholder="/run/secrets/jira" spellcheck="false"></label>
+      </div>
+      <small class="quiet">Secrets are never entered here. Set them on the gateway host, then save.</small>
+    </fieldset>
+    <label class="field"><span>Extra headers <em>optional, one per line</em></span><textarea id="up-headers" rows="2" placeholder="X-Atlassian-Token: no-check" spellcheck="false"></textarea></label>
+    <p id="up-error" class="error" role="alert" hidden></p>
+    <div class="actions">
+      <button id="up-delete" class="danger ghost left" type="button" hidden>Delete</button>
+      <button class="ghost" type="button" data-close>Cancel</button>
+      <button class="primary" type="submit" id="up-save">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="confirm-dialog" aria-labelledby="confirm-title">
+  <div class="secret-body">
+    <h3 id="confirm-title"></h3>
+    <p id="confirm-text" class="quiet"></p>
+    <div class="actions">
+      <button class="ghost" type="button" data-close>Cancel</button>
+      <button id="confirm-ok" class="primary danger" type="button"></button>
+    </div>
+  </div>
+</dialog>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

@@ -38,3 +38,11 @@ Auth types: `basic` (username/username_env + secret), `bearer`, `header` (`name`
 Exactly one of `secret_env` / `secret_file`. Unknown fields are rejected. Static headers cannot set `Authorization`, `Cookie`, `Host` or hop-by-hop headers.
 
 Requests: `<listen>/<upstream name><upstream path>`; `GET /healthz` is unauthenticated.
+
+Web console (optional, separate listener):
+
+```json
+"admin": { "listen": "127.0.0.1:8788", "token_sha256": "<from hootway admin token>" }
+```
+
+Or set `HOOTWAY_ADMIN_TOKEN` and pass `-admin-listen`. Console changes are validated, saved atomically to the config file and applied live.
