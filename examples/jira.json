@@ -1,0 +1,42 @@
+{
+  "listen": "127.0.0.1:8787",
+  "upstreams": [
+    {
+      "name": "jira",
+      "base_url": "https://your-site.atlassian.net",
+      "auth": {
+        "type": "basic",
+        "username_env": "JIRA_EMAIL",
+        "secret_env": "JIRA_API_TOKEN"
+      },
+      "headers": { "X-Atlassian-Token": "no-check" },
+      "timeout_seconds": 30
+    }
+  ],
+  "keys": [
+    {
+      "id": "sandbox-triage-agent",
+      "sha256": "replace-with-output-of-hootway-key-new-000000000000000000000000",
+      "expires_at": "2026-12-31T23:59:59Z",
+      "requests_per_minute": 120,
+      "grants": [
+        {
+          "upstream": "jira",
+          "methods": ["GET"],
+          "paths": [
+            "/rest/api/3/myself",
+            "/rest/api/3/issue/*",
+            "/rest/api/3/issue/*/comment",
+            "/rest/api/3/search/**",
+            "/rest/api/3/project/*"
+          ]
+        },
+        {
+          "upstream": "jira",
+          "methods": ["POST"],
+          "paths": ["/rest/api/3/issue/*/comment"]
+        }
+      ]
+    }
+  ]
+}

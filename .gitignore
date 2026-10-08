@@ -1,0 +1,4 @@
+/hootway
+/dist/
+*.local.json
+.env

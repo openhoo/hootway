@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Format
+        run: test -z "$(gofmt -l .)"
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race -cover ./...
+      - name: Validate example
+        run: |
+          go build -o hootway ./cmd/hootway
+          key_hash=$(printf 'hw_ci' | ./hootway key hash)
+          sed "s/replace-with-output-of-hootway-key-new-000000000000000000000000/$key_hash/" examples/jira.json > ci.json
+          JIRA_EMAIL=ci@example.com JIRA_API_TOKEN=ci ./hootway check -config ci.json
