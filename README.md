@@ -17,10 +17,16 @@ agent sandbox ── Bearer hw_… ──▶ Hootway ── Basic <real Jira tok
 The agent never sees the upstream secret. Revoking or narrowing access is a
 config change, not a credential rotation.
 
+## Install
+
+- Binaries for Linux, macOS and Windows: [latest release](https://github.com/openhoo/hootway/releases/latest)
+  (signed with Sigstore; `gh attestation verify <archive> -R openhoo/hootway`)
+- Container: `docker pull ghcr.io/openhoo/hootway:latest`
+- Go: `go install github.com/openhoo/hootway/cmd/hootway@latest`
+
 ## Quick start (Jira Cloud)
 
 ```sh
-go install github.com/openhoo/hootway/cmd/hootway@latest
 
 hootway key new            # prints a hw_… key and its sha256
 cp examples/jira.json hootway.json
@@ -126,10 +132,9 @@ unknown fields, unknown upstreams and malformed grants fail `hootway check`.
 ## Container
 
 ```sh
-docker build -t hootway .
 docker run --rm -p 8787:8787 -p 127.0.0.1:8788:8788 \
   -v $PWD/config:/etc/hootway \
-  -e JIRA_EMAIL -e JIRA_API_TOKEN -e HOOTWAY_ADMIN_TOKEN hootway \
+  -e JIRA_EMAIL -e JIRA_API_TOKEN -e HOOTWAY_ADMIN_TOKEN ghcr.io/openhoo/hootway:latest \
   serve -config /etc/hootway/hootway.json -listen 0.0.0.0:8787 -admin-listen 0.0.0.0:8788
 ```
 

@@ -17,7 +17,10 @@ import (
 	"github.com/openhoo/hootway/internal/gateway"
 )
 
-var version = "dev"
+var (
+	version = "dev"
+	commit  = "unknown"
+)
 
 const usage = `Hootway gives agents scoped virtual keys instead of real API credentials.
 
@@ -133,7 +136,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		fmt.Fprintln(stderr, "Sign in to the console with the token; store only the sha256 in admin.token_sha256.")
 		return nil
 	case "version", "--version":
-		fmt.Fprintln(stdout, version)
+		fmt.Fprintf(stdout, "hootway %s (%s)\n", version, commit)
 		return nil
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
