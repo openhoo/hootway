@@ -21,7 +21,7 @@ Hootway replaces a real API credential with a revocable virtual key (`hw_…`) a
 
 ## Operator setup
 
-1. Install a signed binary from <https://github.com/openhoo/hootway/releases/latest>, `docker pull ghcr.io/openhoo/hootway:latest`, or `go install github.com/openhoo/hootway/cmd/hootway@latest`.
+1. Install a signed binary from <https://github.com/openhoo/hootway/releases/latest>, `docker pull openhoo/hootway:latest` (Docker Hub; also `ghcr.io/openhoo/hootway`), or `go install github.com/openhoo/hootway/cmd/hootway@latest`.
 2. `hootway key new` — give the `hw_…` key to the agent, store only the `sha256`.
 3. Write `hootway.json` (see [references/config.md](references/config.md)). Keep real secrets in environment variables or files referenced by `secret_env` / `secret_file`.
 4. Grant the smallest set: read paths with `GET`, writes only on specific endpoints. `*` = one segment, final `/**` = subtree.
