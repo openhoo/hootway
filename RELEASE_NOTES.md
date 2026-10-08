@@ -1,6 +1,10 @@
 Hootway lets agent sandboxes call logged-in APIs such as Jira with scoped virtual keys instead of real credentials.
 
-## Changes since 0.1.0
+## Changes since 0.2.0
+
+- The signed multi-arch image is now also published to Docker Hub: `docker pull openhoo/hootway` (same digest as `ghcr.io/openhoo/hootway`)
+
+## Changes in 0.2.0
 
 ### Security
 
@@ -30,7 +34,7 @@ Hootway lets agent sandboxes call logged-in APIs such as Jira with scoped virtua
 - Credential injection: basic (Jira e-mail + API token), bearer, custom header, query
 - Caller credentials and cookies stripped, upstream `Set-Cookie` removed, redirects kept in the gateway
 - Zen web console on a separate listener: keys, upstreams, live activity and policy check; changes validated, saved atomically and applied live
-- Static binaries for Linux, macOS and Windows; multi-arch image `ghcr.io/openhoo/hootway`
+- Static binaries for Linux, macOS and Windows; multi-arch image `openhoo/hootway` (Docker Hub) and `ghcr.io/openhoo/hootway`
 - Agent skills: `npx skills add openhoo/hootway --skill hootway-agent-access`
 
 Verify an archive: `cosign verify-blob --bundle <file>.sigstore.json --certificate-identity-regexp 'https://github.com/openhoo/hootway/' --certificate-oidc-issuer https://token.actions.githubusercontent.com <file>` or `gh attestation verify <file> -R openhoo/hootway`.

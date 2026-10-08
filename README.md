@@ -21,7 +21,7 @@ config change, not a credential rotation.
 
 - Binaries for Linux, macOS and Windows: [latest release](https://github.com/openhoo/hootway/releases/latest)
   (signed with Sigstore; `gh attestation verify <archive> -R openhoo/hootway`)
-- Container: `docker pull ghcr.io/openhoo/hootway:latest`
+- Container: `docker pull openhoo/hootway:latest` (Docker Hub) or `docker pull ghcr.io/openhoo/hootway:latest`
 - Go: `go install github.com/openhoo/hootway/cmd/hootway@latest`
 
 ## Quick start (Jira Cloud)

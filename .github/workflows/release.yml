@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+env:
+  GHCR_IMAGE: ghcr.io/openhoo/hootway
+  DOCKERHUB_IMAGE: docker.io/openhoo/hootway
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -92,6 +96,10 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Image metadata
         id: meta
         env:
@@ -103,11 +111,13 @@ jobs:
             echo "commit=$(git rev-parse HEAD)"
             echo "date=$(git show -s --format=%cI HEAD)"
             echo 'tags<<EOF'
-            echo "ghcr.io/openhoo/hootway:${version}"
-            if [[ "$version" != *-* ]]; then
-              echo "ghcr.io/openhoo/hootway:${version%.*}"
-              echo 'ghcr.io/openhoo/hootway:latest'
-            fi
+            for image in "$GHCR_IMAGE" "$DOCKERHUB_IMAGE"; do
+              echo "${image}:${version}"
+              if [[ "$version" != *-* ]]; then
+                echo "${image}:${version%.*}"
+                echo "${image}:latest"
+              fi
+            done
             echo EOF
           } >> "$GITHUB_OUTPUT"
       - name: Build and push multi-platform image
@@ -128,10 +138,25 @@ jobs:
       - name: Sign image digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "ghcr.io/openhoo/hootway@${DIGEST}"
+        run: |
+          for image in "$GHCR_IMAGE" "$DOCKERHUB_IMAGE"; do
+            cosign sign --yes "${image}@${DIGEST}"
+          done
       - name: Smoke test published image
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          docker run --rm "ghcr.io/openhoo/hootway@${DIGEST}" version
-          { echo '```'; docker buildx imagetools inspect "ghcr.io/openhoo/hootway@${DIGEST}"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          for image in "$GHCR_IMAGE" "$DOCKERHUB_IMAGE"; do
+            docker run --rm "${image}@${DIGEST}" version
+          done
+          { echo '```'; docker buildx imagetools inspect "${DOCKERHUB_IMAGE}@${DIGEST}"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Update Docker Hub repository information
+        # Cosmetic; never fail a published release on it.
+        continue-on-error: true
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: openhoo/hootway
+          short-description: Credential-injecting API gateway that gives agent sandboxes scoped virtual keys instead of real API tokens.
+          enable-url-completion: true
