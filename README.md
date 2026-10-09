@@ -93,7 +93,11 @@ without a restart. Light and dark themes follow the system and can be toggled.
 
 | Activity (dark) | Mobile |
 | --- | --- |
-| ![Activity](docs/screenshots/activity-dark.png) | ![Mobile](docs/screenshots/mobile-dark.png) |
+| ![Activity with gateway and proxy requests](docs/screenshots/activity-dark.png) | ![Mobile](docs/screenshots/mobile-dark.png) |
+
+| Upstreams with outbound routes | Upstream outbound proxy |
+| --- | --- |
+| ![Upstreams](docs/screenshots/upstreams.png) | ![Outbound proxy setting](docs/screenshots/upstream-proxy.png) |
 
 "Test connection" sends one `GET` with the credential to the service's
 "current user" endpoint and reports only the status; no response body is

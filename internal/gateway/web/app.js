@@ -491,7 +491,8 @@ function renderEvents() {
     const ok = e.outcome === "forwarded" || e.outcome === "tunnel";
     return el("div", { class: "ev" + (ok ? "" : " denied") },
       el("span", { class: "t" }, new Date(e.time).toLocaleTimeString()),
-      el("span", { class: "m", title: e.proxy ? "via proxy" : null }, e.method + (e.proxy ? " ⇄" : "")),
+      el("span", { class: "m", title: e.proxy ? "via proxy" : null }, e.method,
+        e.proxy ? el("span", { "aria-hidden": "true" }, " ⇄") : null, e.proxy ? el("span", { class: "sr-only" }, " via proxy") : null),
       el("span", { class: "p" }, e.path, e.key ? el("span", { class: "k" }, e.key) : null),
       el("span", { class: "o" }, el("span", { class: "pill" + (ok ? "" : e.outcome === "upstream_error" ? " warn" : " bad") },
         `${e.status} ${outcomeText[e.outcome] || e.outcome}`)));
