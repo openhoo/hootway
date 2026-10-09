@@ -266,8 +266,8 @@ Release binaries (`-s -w -trimpath`, standard library only):
 | darwin/arm64 | 8.0 MB | 3.2 MB |
 | windows/amd64 | 8.6 MB | 3.5 MB |
 
-The container image (`scratch` + CA bundle) is about 6.9 MB uncompressed and
-2.8 MB compressed. The console is embedded precompressed (about 13.6 KB on the
+The container image (`scratch` + CA bundle, linux/amd64) is about 7.9 MB
+uncompressed and 3.4 MB compressed. The console is embedded precompressed (about 13.6 KB on the
 wire) and revalidated with ETags.
 
 Gateway work per request on an Apple M4 Max (`go test -bench`, loopback
