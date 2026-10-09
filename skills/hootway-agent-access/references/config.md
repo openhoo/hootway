@@ -46,3 +46,4 @@ Web console (optional, separate listener):
 ```
 
 Or set `HOOTWAY_ADMIN_TOKEN` and pass `-admin-listen`. Console changes are validated, saved atomically to the config file and applied live.
+Console-stored tokens (New key wizard) live in `secrets/` next to the config file as `0600` files referenced by `secret_file`; mount that directory writable for UID 65532 in containers.

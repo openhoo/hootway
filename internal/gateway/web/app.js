@@ -163,8 +163,8 @@ function renderKeys() {
   if (!d.keys.length) {
     const can = d.upstreams.length > 0;
     list.replaceChildren(empty("No keys yet",
-      can ? "Create a key and give it to an agent instead of a real API token." : "Add an upstream first, then create a key for it.",
-      can ? "New key" : "New upstream", () => (can ? openKey() : openUpstream())));
+      can ? "Create a key and give it to an agent instead of a real API token." : "Pick a service such as Jira or GitLab; Hootway walks you through the token.",
+      "New key", () => openWizard()));
     return;
   }
   list.replaceChildren(...d.keys.map((k) => {
@@ -256,7 +256,7 @@ function openKey(k) {
   $("#key-dialog").showModal();
   (k ? $("#key-desc") : $("#key-id")).focus();
 }
-$("#new-key").addEventListener("click", () => openKey());
+$("#new-key").addEventListener("click", () => openWizard());
 $("#add-grant").addEventListener("click", () => {
   const r = grantRow({ upstream: state.data.upstreams[0]?.name, methods: ["GET"], paths: [] });
   $("#grant-rows").append(r); $(".g-paths", r).focus();
@@ -302,13 +302,16 @@ $("#key-form").addEventListener("submit", async (e) => {
   });
 });
 
-function showSecret(key, upstream) {
+function showSecret(key, upstream, hint) {
   $("#secret-value").textContent = key;
   const base = state.data.gateway_url + "/" + (upstream || "jira");
+  const p = hint?.env || "HOOTWAY";
+  const curl = hint?.test ? `curl -H "Authorization: Bearer $${p}_TOKEN" "$${p}_URL${hint.test}"`
+    : `curl -H "Authorization: Bearer $${p}_TOKEN" "$${p}_URL/…"`;
   $("#secret-snippet").textContent =
-`export HOOTWAY_URL=${base}
-export HOOTWAY_KEY=${key}
-curl -H "Authorization: Bearer $HOOTWAY_KEY" "$HOOTWAY_URL/…"`;
+`export ${p}_URL=${base}
+export ${p}_TOKEN=${key}
+${curl}`;
   $("#secret-dialog").showModal();
   $("#copy-secret").focus();
 }
@@ -369,6 +372,9 @@ function openUpstream(u) {
   $("#up-auth-name").value = a.name || ""; $("#up-auth-prefix").value = a.prefix || "";
   $("#up-user").value = a.username || ""; $("#up-user-env").value = a.username_env || "";
   $("#up-secret-env").value = a.secret_env || ""; $("#up-secret-file").value = a.secret_file || "";
+  $("#up-secret").value = "";
+  $("#up-secret").disabled = !state.data.secret_storage;
+  $("#up-secret").placeholder = state.data.secret_storage ? "Paste a new token to store it on the gateway" : "Needs a writable config file";
   $("#up-headers").value = u && u.headers ? Object.entries(u.headers).map(([k, v]) => `${k}: ${v}`).join("\n") : "";
   $("#up-delete").hidden = !u;
   syncAuthFields(); setError("#up-error");
@@ -388,6 +394,7 @@ $("#up-form").addEventListener("submit", async (e) => {
   if (type === "header" && $("#up-auth-prefix").value) auth.prefix = $("#up-auth-prefix").value;
   if (type === "basic") { if (v("#up-user")) auth.username = v("#up-user"); if (v("#up-user-env")) auth.username_env = v("#up-user-env"); }
   if (type !== "none") { if (v("#up-secret-env")) auth.secret_env = v("#up-secret-env"); if (v("#up-secret-file")) auth.secret_file = v("#up-secret-file"); }
+  const secret = type !== "none" ? $("#up-secret").value.trim() : "";
   const headers = {};
   for (const line of $("#up-headers").value.split("\n")) {
     if (!line.trim()) continue;
@@ -397,9 +404,11 @@ $("#up-form").addEventListener("submit", async (e) => {
   }
   const body = { name, base_url: v("#up-url"), description: v("#up-desc"), auth, timeout_seconds: parseInt($("#up-timeout").value || "0", 10) || 0 };
   if (Object.keys(headers).length) body.headers = headers;
+  if (secret) body.secret = secret;
   await busy($("#up-save"), async () => {
     try {
       await api("PUT", "/upstreams/" + encodeURIComponent(name), body);
+      $("#up-secret").value = "";
       $("#up-dialog").close(); await refresh();
       const now = state.data.upstreams.find((u) => u.name === name);
       toast(now && now.problem ? "Saved — the credential is not available yet" : "Upstream saved");
@@ -478,10 +487,308 @@ for (const b of document.querySelectorAll("[data-close]")) b.addEventListener("c
 for (const d of document.querySelectorAll("dialog")) {
   let down = null;
   d.addEventListener("pointerdown", (e) => (down = e.target));
-  d.addEventListener("click", (e) => { if (e.target === d && down === d && d.id !== "secret-dialog") d.close(); });
+  d.addEventListener("click", (e) => { if (e.target === d && down === d && d.id !== "secret-dialog" && d.id !== "wiz") d.close(); });
   d.addEventListener("close", () => setTimeout(restoreFocus));
 }
 document.addEventListener("visibilitychange", () => { if (!document.hidden && !$("#app").hidden) refresh(); });
 
 // boot
 api("GET", "/session").then((s) => (s.authenticated ? showApp() : showLogin())).catch(showLogin);
+
+// new-key wizard: pick a service, say where it runs, create the real token
+// on the service's own page, then create a scoped virtual key for it.
+const wiz = { step: "pick", preset: null, variant: null, level: "read", values: {} };
+const variantOf = () => wiz.preset.variants.find((v) => v.id === wiz.variant);
+const pv = (k) => variantOf()[k] ?? wiz.preset[k];
+const levelsOf = () => pv("levels");
+
+function normalizeURL(raw) {
+  let s = raw.trim();
+  if (!s) return "";
+  if (!/^https?:\/\//i.test(s)) s = "https://" + s;
+  let u;
+  try { u = new URL(s); } catch { return null; }
+  if (!/^https?:$/.test(u.protocol) || !u.hostname || u.username || u.password) return null;
+  return (u.origin + u.pathname).replace(/\/+$/, "");
+}
+
+function fieldValues() {
+  const out = {};
+  for (const f of variantOf().fields) {
+    const raw = ($("#wf-" + f.id)?.value || "").trim();
+    if (f.kind === "site") {
+      let site = raw.replace(/^https?:\/\//i, "").toLowerCase();
+      const cut = site.indexOf(f.suffix);
+      if (cut >= 0) site = site.slice(0, cut);
+      if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(site)) throw new Error(`${f.label}: enter the name before ${f.suffix}.`);
+      out[f.id] = site;
+    } else if (f.kind === "url") {
+      const u = normalizeURL(raw);
+      if (!u) throw new Error(`${f.label}: enter the address of your server, for example ${f.placeholder}.`);
+      out[f.id] = u;
+    } else if (f.kind === "email") {
+      if (!/^[^\s@:]+@[^\s@:]+$/.test(raw)) throw new Error(`${f.label}: enter an e-mail address.`);
+      out[f.id] = raw;
+    }
+  }
+  return out;
+}
+
+// The upstream that the wizard would create for the current answers.
+function draftUpstream(name) {
+  const v = variantOf();
+  const auth = { ...v.auth };
+  if (auth.type === "basic") auth.username = v.username(wiz.values);
+  const up = { name, base_url: v.base(wiz.values), description: `${wiz.preset.name} · ${v.label}`, auth, timeout_seconds: 60 };
+  const headers = pv("headers");
+  if (headers) up.headers = { ...headers };
+  return up;
+}
+
+function sameUpstream(u, d) {
+  return u.base_url.replace(/\/+$/, "") === d.base_url && u.auth.type === d.auth.type && (u.auth.username || "") === (d.auth.username || "");
+}
+function existingMatch() {
+  let d;
+  try { wiz.values = fieldValues(); d = draftUpstream("x"); } catch { return null; }
+  return state.data.upstreams.find((u) => sameUpstream(u, d)) || null;
+}
+function freeName(base, taken) {
+  if (!taken.has(base)) return base;
+  for (let i = 2; ; i++) if (!taken.has(`${base}-${i}`)) return `${base}-${i}`;
+}
+
+function wizSteps() {
+  const s = ["pick"];
+  if (!wiz.preset) return s;
+  const needsWhere = wiz.preset.variants.length > 1 || variantOf().fields.length || Object.keys(levelsOf()).length > 1 || !!wiz.reuse;
+  if (needsWhere) s.push("where");
+  if (!wiz.reuse || !$("#wiz-reuse-box").checked) s.push("token");
+  s.push("key");
+  return s;
+}
+
+function openWizard() {
+  Object.assign(wiz, { step: "pick", preset: null, variant: null, level: "read", values: {}, reuse: null, tested: null });
+  $("#wiz-presets").replaceChildren(...PRESETS.map((p) => {
+    const used = state.data.upstreams.some((u) => u.name === p.id || u.name.startsWith(p.id + "-"));
+    return el("button", { class: "tile", type: "button", "data-preset": p.id, onclick: () => pickPreset(p) },
+      logo(p),
+      el("span", { class: "tile-text" }, el("strong", {}, p.name), el("span", { class: "quiet small" }, used ? "Connected · " + p.blurb : p.blurb)));
+  }));
+  $("#wiz-custom").hidden = false;
+  $("#wiz-secret").value = ""; $("#wiz-env").value = "";
+  showStep("pick");
+  $("#wiz").showModal();
+  $("#wiz-presets .tile").focus();
+}
+
+// CSP forbids inline style attributes; CSSOM property writes are allowed.
+function logo(p) {
+  const n = el("span", { class: "logo", "aria-hidden": "true" }, p.mark);
+  n.style.setProperty("--c", p.color);
+  return n;
+}
+
+function pickPreset(p) {
+  wiz.preset = p; wiz.variant = p.variants[0].id; wiz.level = "read"; wiz.values = {}; wiz.tested = null;
+  renderWhere();
+  wiz.reuse = existingMatch();
+  syncReuse();
+  go(+1);
+}
+
+function renderWhere() {
+  const p = wiz.preset;
+  $("#wiz-variant-set").hidden = p.variants.length < 2;
+  $("#wiz-variants").replaceChildren(...p.variants.map((v) =>
+    el("label", {}, el("input", { type: "radio", name: "wiz-variant", value: v.id, checked: v.id === wiz.variant,
+      onchange: () => { wiz.variant = v.id; renderFields(); onWhereInput(); } }), " ", v.label)));
+  renderFields();
+  const levels = levelsOf();
+  if (!levels[wiz.level]) wiz.level = Object.keys(levels)[0];
+  $("#wiz-level-set").hidden = false;
+  $("#wiz-levels").replaceChildren(...Object.keys(levels).map((l) =>
+    el("label", { class: "choice" }, el("input", { type: "radio", name: "wiz-level", value: l, checked: l === wiz.level,
+      onchange: () => { wiz.level = l; } }),
+    el("span", {}, el("strong", {}, l === "read" ? "Read only" : "Read and write"), el("span", { class: "quiet small" }, p.levelText[l])))));
+}
+
+function renderFields() {
+  const prev = {};
+  for (const i of document.querySelectorAll("#wiz-fields input")) prev[i.id] = i.value;
+  $("#wiz-fields").replaceChildren(...variantOf().fields.map((f) => {
+    const input = el("input", { id: "wf-" + f.id, placeholder: f.placeholder, spellcheck: "false", autocomplete: f.kind === "email" ? "email" : "off",
+      type: f.kind === "email" ? "email" : f.kind === "url" ? "url" : "text", inputmode: f.kind === "url" ? "url" : null, oninput: onWhereInput });
+    input.value = prev["wf-" + f.id] || "";
+    const control = f.kind === "site" ? el("span", { class: "affix" }, el("span", { class: "quiet" }, f.prefix), input, el("span", { class: "quiet" }, f.suffix)) : input;
+    return el("label", { class: "field" }, el("span", {}, f.label), control, f.hint ? el("small", { class: "quiet" }, f.hint) : null);
+  }));
+}
+
+function onWhereInput() { wiz.reuse = existingMatch(); syncReuse(); }
+function syncReuse() {
+  const r = wiz.reuse;
+  $("#wiz-reuse").hidden = !r;
+  if (r) {
+    $("#wiz-reuse span").textContent = r.problem ? `Use the existing /${r.name} connection (its credential is currently missing)` : `Use the existing /${r.name} connection — no new token needed`;
+  }
+  updateProgress();
+}
+$("#wiz-reuse-box").addEventListener("change", updateProgress);
+
+function showStep(step) {
+  wiz.step = step;
+  for (const s of document.querySelectorAll("#wiz [data-step]")) s.hidden = s.dataset.step !== step;
+  $("#wiz-back").hidden = step === "pick";
+  $("#wiz-next").hidden = step === "pick";
+  const p = wiz.preset;
+  $("#wiz-title").textContent = step === "pick" ? "New key" : step === "where" ? `Connect ${p.name}`
+    : step === "token" ? `${p.name} token` : "Agent key";
+  $("#wiz-next").textContent = step === "key" ? "Create key" : "Continue";
+  setError("#wiz-error");
+  updateProgress();
+  if (step === "token") enterToken();
+  if (step === "key") enterKey();
+}
+function updateProgress() {
+  const s = wizSteps();
+  $("#wiz-progress").textContent = wiz.step === "pick" ? "" : `Step ${s.indexOf(wiz.step) + 1} of ${s.length}`;
+}
+
+function go(dir) {
+  const s = wizSteps();
+  const i = s.indexOf(wiz.step);
+  const next = s[Math.min(s.length - 1, Math.max(0, i + dir))];
+  showStep(next);
+  const focus = {
+    pick: "#wiz-presets .tile", where: "#wiz-fields input, #wiz-variants input:checked, #wiz-levels input:checked",
+    token: "#wiz-token-link", key: "#wiz-key-id",
+  }[next];
+  $(focus)?.focus();
+}
+$("#wiz-back").addEventListener("click", () => go(-1));
+$("#wiz-custom").addEventListener("click", () => { $("#wiz").close(); state.data.upstreams.length ? openKey() : openUpstream(); });
+
+function tokenSource() { return document.querySelector('input[name="wiz-src"]:checked').value; }
+function syncSource() {
+  const src = tokenSource();
+  for (const n of document.querySelectorAll("#wiz [data-src]")) n.hidden = n.dataset.src !== src;
+  wiz.tested = null; $("#wiz-test-result").textContent = ""; $("#wiz-test-result").className = "test-result";
+}
+for (const r of document.querySelectorAll('input[name="wiz-src"]')) r.addEventListener("change", () => { syncSource(); $(tokenSource() === "paste" ? "#wiz-secret" : "#wiz-env").focus(); });
+$("#wiz-secret").addEventListener("input", () => { wiz.tested = null; $("#wiz-test-result").textContent = ""; });
+
+function enterToken() {
+  const v = variantOf();
+  const help = pv("tokenHelp");
+  $("#wiz-token-help").textContent = help ? help(wiz.level) : "Create a personal access token for the account the agent should act as.";
+  $("#wiz-token-link").href = v.token(wiz.values, wiz.level);
+  const store = state.data.secret_storage;
+  $("#wiz-nostore").hidden = store;
+  document.querySelector('input[name="wiz-src"][value="paste"]').disabled = !store;
+  if (!store) document.querySelector('input[name="wiz-src"][value="env"]').checked = true;
+  if (!$("#wiz-env").value) $("#wiz-env").value = `${wiz.preset.env}_TOKEN`;
+  $("#wiz-test").hidden = !pv("test");
+  syncSource();
+}
+
+async function testToken(btn) {
+  const out = $("#wiz-test-result");
+  const body = { upstream: draftUpstream("draft"), path: pv("test") };
+  if (tokenSource() === "paste") {
+    const secret = $("#wiz-secret").value.trim();
+    if (!secret) { out.className = "test-result bad"; out.textContent = "Paste the token first."; $("#wiz-secret").focus(); return; }
+    body.secret = secret;
+  } else {
+    body.upstream.auth.secret_env = $("#wiz-env").value.trim();
+  }
+  out.className = "test-result"; out.textContent = "Testing…";
+  await busy(btn, async () => {
+    try {
+      const r = await api("POST", "/probe", body);
+      wiz.tested = r.ok;
+      out.className = "test-result " + (r.ok ? "ok" : "bad");
+      out.textContent = (r.ok ? "✓ " : "") + r.message[0].toUpperCase() + r.message.slice(1) + (r.status && !r.ok ? ` (${r.status})` : "");
+    } catch (err) { out.className = "test-result bad"; out.textContent = err.message; }
+  });
+}
+$("#wiz-test").addEventListener("click", (e) => testToken(e.currentTarget));
+
+function enterKey() {
+  const name = wiz.upstreamName();
+  const ids = new Set(state.data.keys.map((k) => k.id));
+  if (!$("#wiz-key-id").dataset.touched) $("#wiz-key-id").value = freeName(`${name}-agent`, ids);
+  const grants = levelsOf()[wiz.level];
+  $("#wiz-rules").replaceChildren(...grants.map((g) => el("div", { class: "grant fixed" },
+    el("span", { class: "g-up mono" }, "/" + name),
+    el("input", { "aria-label": "Methods", class: "g-methods", value: g.methods.join(" "), spellcheck: "false" }),
+    el("textarea", { "aria-label": "Paths, one per line", class: "g-paths", rows: g.paths.length, spellcheck: "false" }, g.paths.join("\n")))));
+  const note = pv("note");
+  $("#wiz-note").textContent = note || ""; $("#wiz-note").hidden = !note;
+}
+$("#wiz-key-id").addEventListener("input", (e) => { e.target.dataset.touched = "1"; });
+
+wiz.upstreamName = () => {
+  if (wiz.reuse && $("#wiz-reuse-box").checked) return wiz.reuse.name;
+  return freeName(wiz.preset.id, new Set(state.data.upstreams.map((u) => u.name)));
+};
+
+function validateStep() {
+  if (wiz.step === "where") {
+    wiz.values = fieldValues();
+    wiz.reuse = existingMatch(); syncReuse();
+  }
+  if (wiz.step === "token") {
+    if (tokenSource() === "paste" && !$("#wiz-secret").value.trim()) throw new Error("Paste the token you created, or choose Environment variable.");
+    if (tokenSource() === "env" && !/^[A-Za-z_][A-Za-z0-9_]*$/.test($("#wiz-env").value.trim())) throw new Error("Enter a variable name such as " + wiz.preset.env + "_TOKEN.");
+    if (wiz.tested === false && !$("#wiz-next").dataset.confirm) {
+      $("#wiz-next").dataset.confirm = "1";
+      throw new Error("The test failed. Fix the token or URL, or press Continue again to save it anyway.");
+    }
+  }
+}
+
+$("#wiz-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (wiz.step === "pick") return;
+  try { validateStep(); } catch (err) { return setError("#wiz-error", err.message); }
+  delete $("#wiz-next").dataset.confirm;
+  if (wiz.step !== "key") return go(+1);
+  await busy($("#wiz-next"), createFromWizard);
+});
+
+async function createFromWizard() {
+  const id = $("#wiz-key-id").value.trim();
+  if (!/^[a-z0-9][a-z0-9_-]{0,62}$/.test(id)) return setError("#wiz-error", "Key name: use lowercase letters, digits, - and _.");
+  const name = wiz.upstreamName();
+  const grants = [...document.querySelectorAll("#wiz-rules .grant")].map((r) => ({
+    upstream: name,
+    methods: $(".g-methods", r).value.toUpperCase().split(/[\s,]+/).filter(Boolean),
+    paths: $(".g-paths", r).value.split("\n").map((s) => s.trim()).filter(Boolean),
+  })).filter((g) => g.methods.length && g.paths.length);
+  if (!grants.length) return setError("#wiz-error", "Keep at least one access rule.");
+  const rpm = parseInt($("#wiz-rpm").value || "0", 10);
+  if (Number.isNaN(rpm) || rpm < 0) return setError("#wiz-error", "Per minute must be 0 or more.");
+  const days = $("#wiz-expires").value;
+  const expires = days ? new Date(Date.now() + days * 86400000).toISOString() : null;
+  try {
+    if (!(wiz.reuse && $("#wiz-reuse-box").checked)) {
+      const up = draftUpstream(name);
+      if (tokenSource() === "paste") up.secret = $("#wiz-secret").value.trim();
+      else up.auth.secret_env = $("#wiz-env").value.trim();
+      await api("PUT", "/upstreams/" + encodeURIComponent(name), up);
+      $("#wiz-secret").value = "";
+      // A retry after a failed key creation must not create a second upstream.
+      await refresh();
+      wiz.reuse = state.data.upstreams.find((u) => u.name === name); $("#wiz-reuse-box").checked = true;
+    }
+    const res = await api("POST", "/keys", { id, description: `${wiz.preset.name} · ${wiz.level === "read" ? "read only" : "read and write"}`,
+      disabled: false, expires_at: expires, requests_per_minute: rpm, grants });
+    $("#wiz").close();
+    showSecret(res.key, name, { env: wiz.preset.env, test: pv("test") });
+    delete $("#wiz-key-id").dataset.touched;
+    await refresh();
+  } catch (err) { setError("#wiz-error", err.message); }
+}
+$("#wiz").addEventListener("close", () => { $("#wiz-secret").value = ""; delete $("#wiz-key-id").dataset.touched; });

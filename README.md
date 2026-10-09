@@ -67,9 +67,18 @@ Open <http://127.0.0.1:8788> and sign in with the token.
 - **Keys** — create, edit, disable, rotate or delete keys and their access
   rules. A new or rotated key is shown once, with a copyable sandbox snippet;
   only its hash is saved.
+- **New key presets** — pick Jira, Confluence, Bitbucket, GitLab, GitHub,
+  Gitea/Forgejo, Linear, Plane, Sentry, Grafana or Notion, choose cloud or
+  self-hosted (and enter the URL), choose read-only or read-and-write, and the
+  console opens the service's own token page — prefilled where the service
+  supports it (GitLab scopes, GitHub fine-grained permissions). Paste the token,
+  test the connection, review the suggested access rules and create the key.
+  A second key for the same service reuses the existing connection.
 - **Upstreams** — base URL, credential type and where the secret comes from
-  (environment variable or file). Secrets are never typed into the console;
-  upstreams whose secret is missing are flagged and answer `503` until fixed.
+  (environment variable or file). A token pasted in the console is stored
+  write-only in a `0600` file in `secrets/` next to the config and is never
+  shown again; upstreams whose secret is missing are flagged and answer `503`
+  until fixed.
 - **Activity** — the last 1,000 requests with key, method, path and outcome.
   No query strings, bodies or credentials are recorded.
 - **Check** — asks the active policy whether a key may call a method and path,
@@ -78,9 +87,17 @@ Open <http://127.0.0.1:8788> and sign in with the token.
 Changes are validated, written atomically to the config file and applied
 without a restart. Light and dark themes follow the system and can be toggled.
 
+| New key | Token step |
+| --- | --- |
+| ![Pick a service](docs/screenshots/new-key.png) | ![Create the token](docs/screenshots/new-key-token.png) |
+
 | Activity (dark) | Mobile |
 | --- | --- |
 | ![Activity](docs/screenshots/activity-dark.png) | ![Mobile](docs/screenshots/mobile-dark.png) |
+
+"Test connection" sends one `GET` with the credential to the service's
+"current user" endpoint and reports only the status; no response body is
+returned to the browser.
 
 Keep the console on localhost or behind your own TLS and access control. The
 admin API is also scriptable with `Authorization: Bearer hwa_…` and the

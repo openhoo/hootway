@@ -7,6 +7,7 @@
 <title>Hootway</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='11' fill='none' stroke='%235b7a6a' stroke-width='3'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/app.css">
+<script src="/presets.js" defer></script>
 <script src="/app.js" defer></script>
 </head>
 <body>
@@ -134,6 +135,94 @@
   </form>
 </dialog>
 
+<dialog id="wiz" class="wide" aria-labelledby="wiz-title">
+  <form id="wiz-form" novalidate>
+    <div class="wiz-top">
+      <button id="wiz-back" class="link" type="button" hidden>← Back</button>
+      <span id="wiz-progress" class="quiet small" aria-live="polite"></span>
+    </div>
+    <h3 id="wiz-title">New key</h3>
+
+    <section data-step="pick">
+      <p class="quiet lead">Which service should the agent use?</p>
+      <div id="wiz-presets" class="tiles"></div>
+      <p class="quiet small center">Something else? <button id="wiz-custom" class="link inline" type="button">Set up a key manually</button></p>
+    </section>
+
+    <section data-step="where" hidden>
+      <fieldset id="wiz-variant-set">
+        <legend>Where is it hosted?</legend>
+        <div id="wiz-variants" class="segmented"></div>
+      </fieldset>
+      <div id="wiz-fields"></div>
+      <fieldset id="wiz-level-set">
+        <legend>What may the agent do?</legend>
+        <div id="wiz-levels" class="choices"></div>
+      </fieldset>
+      <label id="wiz-reuse" class="check reuse" hidden><input id="wiz-reuse-box" type="checkbox" checked> <span></span></label>
+    </section>
+
+    <section data-step="token" hidden>
+      <ol class="steps">
+        <li>
+          <p class="step-title">Create a token</p>
+          <p id="wiz-token-help" class="quiet small"></p>
+          <a id="wiz-token-link" class="button primary" target="_blank" rel="noopener noreferrer">Open token page <span aria-hidden="true">↗</span></a>
+          <p class="quiet small">Opens in a new tab. Sign in there if asked, then come back here.</p>
+        </li>
+        <li>
+          <p class="step-title">Give it to the gateway</p>
+          <div class="segmented" role="radiogroup" aria-label="How the gateway gets the token">
+            <label><input type="radio" name="wiz-src" value="paste" checked> Paste it</label>
+            <label><input type="radio" name="wiz-src" value="env"> Environment variable</label>
+          </div>
+          <label class="field" data-src="paste"><span>Token</span>
+            <input id="wiz-secret" type="password" autocomplete="off" spellcheck="false" placeholder="Paste the token">
+            <small class="quiet">Stored write-only in a private file next to the config. It is never shown again or sent to agents.</small>
+          </label>
+          <label class="field" data-src="env" hidden><span>Variable name on the gateway host</span>
+            <input id="wiz-env" spellcheck="false">
+            <small class="quiet">Set it where Hootway runs and restart the gateway. The upstream is marked until the variable exists.</small>
+          </label>
+          <p id="wiz-nostore" class="quiet small" hidden>This gateway runs without a writable config file, so tokens can only come from environment variables.</p>
+          <div class="test-row">
+            <button id="wiz-test" class="ghost" type="button">Test connection</button>
+            <span id="wiz-test-result" class="test-result" role="status"></span>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <section data-step="key" hidden>
+      <div class="row">
+        <label class="field grow"><span>Key name</span><input id="wiz-key-id" pattern="[a-z0-9][a-z0-9_\-]{0,62}" spellcheck="false" required><small class="quiet">Shown in Activity. Lowercase letters, digits, - and _.</small></label>
+        <label class="field grow"><span>Expires</span>
+          <select id="wiz-expires">
+            <option value="7">in 7 days</option>
+            <option value="30">in 30 days</option>
+            <option value="90" selected>in 90 days</option>
+            <option value="365">in 1 year</option>
+            <option value="">never</option>
+          </select>
+        </label>
+        <label class="field method"><span>Per minute</span><input id="wiz-rpm" type="number" min="0" step="1" value="120" inputmode="numeric"></label>
+      </div>
+      <fieldset>
+        <legend>Access rules <em>edit if needed</em></legend>
+        <div id="wiz-rules"></div>
+        <small class="quiet"><code>*</code> matches one path segment, a final <code>/**</code> everything below.</small>
+      </fieldset>
+      <p id="wiz-note" class="note small" hidden></p>
+    </section>
+
+    <p id="wiz-error" class="error" role="alert" hidden></p>
+    <div class="actions" id="wiz-actions">
+      <button class="ghost" type="button" data-close>Cancel</button>
+      <button class="primary" type="submit" id="wiz-next">Continue</button>
+    </div>
+  </form>
+</dialog>
+
 <dialog id="secret-dialog" aria-labelledby="secret-title">
   <div class="secret-body">
     <h3 id="secret-title">Key ready</h3>
@@ -177,7 +266,8 @@
         <label class="field grow"><span>Secret env variable</span><input id="up-secret-env" placeholder="JIRA_API_TOKEN" spellcheck="false"></label>
         <label class="field grow"><span>or secret file</span><input id="up-secret-file" placeholder="/run/secrets/jira" spellcheck="false"></label>
       </div>
-      <small class="quiet">Secrets are never entered here. Set them on the gateway host, then save.</small>
+      <label class="field" data-auth="basic bearer header query"><span>Replace secret <em>optional, write-only</em></span><input id="up-secret" type="password" autocomplete="off" spellcheck="false" placeholder="Paste a new token to store it on the gateway"></label>
+      <small class="quiet">A pasted secret is saved to a private file on the gateway and never shown again. Otherwise set the variable or file on the gateway host.</small>
     </fieldset>
     <label class="field"><span>Extra headers <em>optional, one per line</em></span><textarea id="up-headers" rows="2" placeholder="X-Atlassian-Token: no-check" spellcheck="false"></textarea></label>
     <p id="up-error" class="error" role="alert" hidden></p>

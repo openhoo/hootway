@@ -15,6 +15,8 @@ Hootway is a security boundary between agent sandboxes and real API credentials.
 - `internal/gateway/secrets.go` — credential resolution/injection and protected headers.
 - `internal/gateway/server.go` — key auth, rate limit, reverse proxy, response sanitising, audit log.
 - `internal/gateway/admin.go` — console + admin API: token sessions, CSRF header, validate → persist atomically → apply.
+- `internal/gateway/admin_secrets.go` — write-only console secrets (`secrets/` next to the config, `0600`, unique names, removed on replace/delete) and `POST /api/probe`.
+- `internal/gateway/web/presets.js` — New-key wizard presets: variants (cloud/self-hosted), token page URLs, test path, read/write grants. Keep grants narrow and token links pointing at the vendor's own page.
 - `internal/gateway/events.go` — in-memory activity ring buffer and per-key stats.
 - `internal/gateway/web/` — plain HTML/CSS/JS console, embedded as `*.gz` — run `scripts/compress-web.sh` after edits (a test fails on stale assets).
 - `examples/jira.json` — reference configuration, validated in CI.
