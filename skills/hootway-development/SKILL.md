@@ -17,6 +17,8 @@ Hootway is a security boundary between agent sandboxes and real API credentials.
 - `internal/gateway/admin.go` — console + admin API: token sessions, CSRF header, validate → persist atomically → apply.
 - `internal/gateway/admin_secrets.go` — write-only console secrets (`secrets/` next to the config, `0600`, unique names, removed on replace/delete) and `POST /api/probe`.
 - `internal/gateway/web/presets.js` — New-key wizard presets: variants (cloud/self-hosted), token page URLs, test path, read/write grants. Keep grants narrow and token links pointing at the vendor's own page.
+- `internal/gateway/proxy.go` — proxy mode: absolute-form requests and CONNECT tunnels terminated with leaf certs from the configured CA; maps real URLs to upstreams by origin + longest base path, then reuses `forward` (same policy path as gateway requests). Never add a passthrough tunnel.
+- `internal/gateway/outbound.go` — `outbound_proxy` validation and resolution into per-upstream egress; transports are shared by (timeout, egress).
 - `internal/gateway/events.go` — in-memory activity ring buffer and per-key stats.
 - `internal/gateway/web/` — plain HTML/CSS/JS console, embedded as `*.gz` — run `scripts/compress-web.sh` after edits (a test fails on stale assets).
 - `examples/jira.json` — reference configuration, validated in CI.
@@ -47,4 +49,4 @@ For Dockerfile or release changes: `docker build -t hootway:dev .`, `IMAGE=hootw
 
 For console changes: `node --check internal/gateway/web/app.js`, `scripts/compress-web.sh`, run `HOOTWAY_ADMIN_TOKEN=hwa_demo hootway serve -config … -admin-listen 127.0.0.1:8788`, and check login, empty states, key create/rotate/delete, activity and check in light/dark and at 390px width. Refresh `docs/screenshots` when the UI changes.
 
-For proxy behaviour changes, also run `hootway serve` against a local test upstream and exercise allowed and denied requests with curl.
+For proxy-mode changes, also exercise `HTTPS_PROXY=http://a:hw_…@127.0.0.1:8787 curl --cacert hootway-ca.pem https://<upstream>/…` for allowed, denied and non-upstream hosts, and a CONNECT without a key (must be `407`). For proxy behaviour changes, also run `hootway serve` against a local test upstream and exercise allowed and denied requests with curl.

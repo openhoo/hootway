@@ -11,6 +11,7 @@ Hootway replaces a real API credential with a revocable virtual key (`hw_…`) a
 
 - Call `<HOOTWAY_URL>/<upstream>/<normal API path>` with `Authorization: Bearer hw_…`.
   If a tool only supports e-mail + token, use any username and the `hw_…` key as password.
+- If you were given a proxy instead (`HTTPS_PROXY=http://…:hw_…@hootway…`), call the real API URL through it; for https trust the provided Hootway CA certificate (`SSL_CERT_FILE` etc.). `407` means the proxy key is missing or invalid; `403 not_an_upstream` means that host is not configured.
 - Do not search for or ask for the real upstream credential.
 - `401 missing_key|invalid_key`: key absent, wrong, disabled or expired — ask the operator.
 - `403 forbidden`: method/path not granted — report the exact method and path you need instead of trying other paths.
@@ -28,6 +29,7 @@ Hootway replaces a real API credential with a revocable virtual key (`hw_…`) a
 5. `hootway check -config hootway.json` (exit 0 = valid and all secrets resolved), then `hootway serve -config hootway.json`.
 6. Run Hootway outside the sandbox; allow the sandbox network to reach Hootway, not the upstream.
 7. Optional console: `hootway admin token`, then `HOOTWAY_ADMIN_TOKEN=hwa_… hootway serve -config hootway.json -admin-listen 127.0.0.1:8788`. **New key** offers presets (Jira, Confluence, Bitbucket, GitLab, GitHub, Gitea/Forgejo, Linear, Plane, Sentry, Grafana, Notion): it asks cloud vs. self-hosted, opens the token page, stores the pasted token write-only under `secrets/` next to the config and suggests read-only or read-write grants. Create/rotate keys, watch Activity and use Check to test a method and path without calling the upstream. Never expose the console to the sandbox network.
-8. Verify one allowed and one denied request with curl before handing over the key.
-9. Revoke in the console (Disable/Delete, applied immediately) or set `"disabled": true` / `expires_at` in the file and restart (SIGTERM drains in-flight requests).
-10. In the container image (`scratch`, UID 65532) mount the config directory readable by 65532, writable if console edits should persist; probe liveness with HTTP `GET /healthz`.
+8. Optional proxy mode for tools that cannot change their base URL: add `"proxy": {}` (plus `hootway proxy ca` and `ca_cert_file`/`ca_key_file` for https upstreams), give the sandbox `HTTPS_PROXY=http://agent:hw_…@<gateway>` and only the CA certificate. If Hootway itself needs an egress proxy, set `outbound_proxy` (top level or per upstream; `{"direct": true}` bypasses it).
+9. Verify one allowed and one denied request with curl before handing over the key.
+10. Revoke in the console (Disable/Delete, applied immediately) or set `"disabled": true` / `expires_at` in the file and restart (SIGTERM drains in-flight requests).
+11. In the container image (`scratch`, UID 65532) mount the config directory readable by 65532, writable if console edits should persist; probe liveness with HTTP `GET /healthz`.

@@ -80,6 +80,7 @@
             <option value="">All</option>
             <option value="forwarded">Forwarded</option>
             <option value="denied">Denied</option>
+            <option value="proxy">Via proxy</option>
           </select>
         </label>
       </div>
@@ -269,6 +270,17 @@
       <label class="field" data-auth="basic bearer header query"><span>Replace secret <em>optional, write-only</em></span><input id="up-secret" type="password" autocomplete="off" spellcheck="false" placeholder="Paste a new token to store it on the gateway"></label>
       <small class="quiet">A pasted secret is saved to a private file on the gateway and never shown again. Otherwise set the variable or file on the gateway host.</small>
     </fieldset>
+    <div class="row">
+      <label class="field grow"><span>Outbound connection</span>
+        <select id="up-egress">
+          <option value="inherit">Gateway default</option>
+          <option value="direct">Direct, no proxy</option>
+          <option value="proxy">Through a proxy</option>
+        </select>
+      </label>
+      <label class="field grow" data-egress="proxy"><span>Proxy URL</span><input id="up-proxy-url" placeholder="http://proxy.internal:3128" spellcheck="false"></label>
+    </div>
+    <small class="quiet" id="up-egress-hint"></small>
     <label class="field"><span>Extra headers <em>optional, one per line</em></span><textarea id="up-headers" rows="2" placeholder="X-Atlassian-Token: no-check" spellcheck="false"></textarea></label>
     <p id="up-error" class="error" role="alert" hidden></p>
     <div class="actions">

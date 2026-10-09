@@ -1,5 +1,20 @@
 Hootway lets agent sandboxes call logged-in APIs such as Jira with scoped virtual keys instead of real credentials.
 
+## Changes in 0.4.0
+
+### Proxy mode
+
+- Hootway can also be used as an HTTP(S) proxy (`"proxy": {}`): agents keep the real API URL and send their virtual key as the proxy password; the same grants, rate limits and credential injection apply
+- `https://` upstreams are intercepted with short-lived per-host certificates from a CA created by `hootway proxy ca`; tunnels need a valid key, only configured upstream hosts are reachable, and keys are rechecked on every request inside a tunnel
+- Activity marks proxied requests and logs their real URL; Check accepts real upstream URLs
+
+### Outbound proxy
+
+- `outbound_proxy` routes Hootway's own upstream connections through an `http`, `https`, `socks5` or `socks5h` proxy, with optional credentials from env or file; upstreams can override it or connect directly, also in the console
+- Without it, `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` apply as before
+
+Binaries grow by about 0.6 MB for the TLS server and certificate issuing.
+
 ## Changes in 0.3.0
 
 ### New key presets

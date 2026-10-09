@@ -118,6 +118,10 @@ admin API is also scriptable with `Authorization: Bearer hwa_…` and the
 | `upstreams[].auth.name`, `prefix` | Header or query name; optional value prefix for `header`. |
 | `upstreams[].headers` | Fixed extra headers. Auth, cookie and hop-by-hop headers are refused. |
 | `upstreams[].timeout_seconds` | Upstream response header timeout, default `60`. |
+| `outbound_proxy` | Proxy for Hootway's own upstream connections (see [Outbound proxy](#outbound-proxy)). |
+| `upstreams[].outbound_proxy` | Per-upstream override, e.g. `{"direct": true}`. |
+| `proxy` | Also accept HTTP(S) proxy requests on `listen` (see [Proxy mode](#proxy-mode)). |
+| `proxy.ca_cert_file`, `ca_key_file` | CA used to terminate `https://` proxy tunnels. |
 | `upstreams[].description`, `keys[].description` | Optional notes shown in the console. |
 | `keys[].sha256` | SHA-256 of the virtual key. Plain keys are never stored. |
 | `keys[].expires_at`, `disabled` | Expiry (RFC 3339) and immediate revocation. |
@@ -127,6 +131,74 @@ admin API is also scriptable with `Authorization: Bearer hwa_…` and the
 Path patterns are upstream-relative: `*` matches exactly one segment, a final
 `/**` matches the prefix and everything below it. Configuration is strict:
 unknown fields, unknown upstreams and malformed grants fail `hootway check`.
+
+## Proxy mode
+
+Some tools cannot change their API base URL. With `"proxy": {}` in the
+config, agents can keep the **real** upstream URL and use Hootway as their
+HTTP proxy instead; the virtual key is the proxy password:
+
+```sh
+export HTTPS_PROXY=http://agent:hw_…@hootway.internal:8787 HTTP_PROXY=$HTTPS_PROXY
+export SSL_CERT_FILE=/etc/hootway-ca.pem          # only for https upstreams
+curl https://your-site.atlassian.net/rest/api/3/issue/ABC-1
+```
+
+- Every proxied request goes through the same key check, grants, rate limit,
+  header stripping and credential injection as `/<name>/…` requests. The
+  upstream is chosen by origin (scheme, host, port) and the longest matching
+  `base_url` path; grants stay upstream-relative.
+- Hootway is **not an open proxy**: other hosts get `403 not_an_upstream`,
+  and `CONNECT` is refused unless the key is valid and the host is a
+  configured `https` upstream.
+- `https://` upstreams need interception, since Hootway must see the path to
+  enforce grants and must inject the credential. Create a CA once and trust
+  its certificate (never the key) in the sandbox:
+
+  ```sh
+  hootway proxy ca -cert hootway-ca.pem -key hootway-ca-key.pem   # key is 0600
+  ```
+
+  ```json
+  "proxy": { "ca_cert_file": "hootway-ca.pem", "ca_key_file": "hootway-ca-key.pem" }
+  ```
+
+  Hootway answers each tunnel itself with a short-lived certificate for that
+  host only (HTTP/1.1) and rechecks the key on every request in the tunnel, so
+  disabling or narrowing a key also applies to open tunnels. Without a CA,
+  `CONNECT` answers `503 proxy_https_unavailable`; plain `http://` upstreams
+  work without one.
+- The key may be sent as proxy credentials (`Proxy-Authorization: Basic` with
+  any username, or `Bearer`) or, for plain HTTP, as the usual API token.
+  Proxy clients see absolute redirects unchanged and follow them through the
+  proxy. Activity marks proxied requests with ⇄ and logs the real URL.
+- Keep the CA key on the gateway only; anyone holding it can impersonate
+  hosts to sandboxes that trust the certificate.
+
+## Outbound proxy
+
+If Hootway itself must reach the upstreams through a corporate or egress
+proxy, set `outbound_proxy`:
+
+```json
+"outbound_proxy": {
+  "url": "http://proxy.corp.example:3128",
+  "username": "hootway", "secret_env": "EGRESS_PROXY_PASSWORD"
+}
+```
+
+- `url` uses `http`, `https`, `socks5` or `socks5h` and must not contain
+  credentials. Optional proxy credentials use `username` / `username_env` and
+  `secret_env` / `secret_file`, like upstream auth; they are never shown in the
+  console or logs.
+- An upstream can override it with its own `outbound_proxy`, or connect
+  directly with `"outbound_proxy": {"direct": true}`. The console's upstream
+  dialog has the same choice.
+- Without `outbound_proxy`, Hootway uses the standard `HTTPS_PROXY`,
+  `HTTP_PROXY` and `NO_PROXY` environment variables, as before.
+- An unresolvable proxy secret marks the affected upstreams as unconfigured
+  (`503`), and `hootway check` fails, exactly like a missing upstream secret.
+  Connection tests in the console use the same route.
 
 ## Security model
 
@@ -173,6 +245,7 @@ exec probe.
 | `hootway check [-config FILE]` | Validate the config and resolve every secret, then exit. |
 | `hootway key new` / `hootway key hash` | Create a virtual key, or hash one read from stdin. |
 | `hootway admin token` | Create a console token and its hash. |
+| `hootway proxy ca [-cert FILE] [-key FILE] [-days N]` | Create a CA for https proxy mode (key `0600`, never overwritten). |
 | `hootway version` | Print version and commit. |
 
 `HOOTWAY_CONFIG` sets the default config path, `HOOTWAY_ADMIN_TOKEN` supplies
@@ -188,10 +261,10 @@ Release binaries (`-s -w -trimpath`, standard library only):
 
 | Target | Binary | gzip -9 |
 | --- | ---: | ---: |
-| linux/amd64 | 7.7 MB | 3.2 MB |
-| linux/arm64 | 7.1 MB | 2.9 MB |
-| darwin/arm64 | 7.4 MB | 3.0 MB |
-| windows/amd64 | 8.0 MB | 3.3 MB |
+| linux/amd64 | 8.4 MB | 3.5 MB |
+| linux/arm64 | 7.7 MB | 3.1 MB |
+| darwin/arm64 | 8.0 MB | 3.2 MB |
+| windows/amd64 | 8.6 MB | 3.5 MB |
 
 The container image (`scratch` + CA bundle) is about 6.9 MB uncompressed and
 2.8 MB compressed. The console is embedded precompressed (about 13.6 KB on the
