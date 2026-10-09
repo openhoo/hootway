@@ -175,6 +175,7 @@ func (a *AdminServer) probe(w http.ResponseWriter, r *http.Request) {
 	}
 	var up Upstream
 	var cred credential
+	var eg egress
 	switch {
 	case req.Upstream != nil:
 		up = *req.Upstream
@@ -197,6 +198,10 @@ func (a *AdminServer) probe(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		cfg := &Config{Upstreams: []Upstream{up}}
+		if op := a.gw.Config().OutboundProxy; op != nil {
+			cp := *op // validate sets parsed; never touch the active config
+			cfg.OutboundProxy = &cp
+		}
 		if err := cfg.validate(); err != nil {
 			writeError(w, http.StatusUnprocessableEntity, "invalid", err.Error())
 			return
@@ -208,6 +213,10 @@ func (a *AdminServer) probe(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cred = c
+		if eg, err = resolveEgress(up.OutboundProxy, cfg.OutboundProxy, a.gw.getenv); err != nil {
+			writeJSON(w, http.StatusOK, probeResult{Message: err.Error()})
+			return
+		}
 	default:
 		rt := a.gw.state.Load().upstreams[req.Name]
 		if rt == nil {
@@ -218,7 +227,7 @@ func (a *AdminServer) probe(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, probeResult{Message: "credential unavailable: " + rt.err.Error()})
 			return
 		}
-		up, cred = rt.up, rt.cred
+		up, cred, eg = rt.up, rt.cred, rt.egress
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
@@ -234,11 +243,15 @@ func (a *AdminServer) probe(w http.ResponseWriter, r *http.Request) {
 	cred.apply(out)
 	transport := a.gw.transport
 	if transport == nil {
-		transport = a.gw.sharedTransport(15 * time.Second)
+		transport = a.gw.sharedTransport(15*time.Second, eg)
 	}
 	res, err := transport.RoundTrip(out)
 	if err != nil {
-		writeJSON(w, http.StatusOK, probeResult{Message: "could not reach " + up.base.Host})
+		msg := "could not reach " + up.base.Host
+		if eg.desc != "" && eg.desc != "environment" && eg.desc != "direct" {
+			msg += " through proxy " + eg.desc
+		}
+		writeJSON(w, http.StatusOK, probeResult{Message: msg})
 		return
 	}
 	io.Copy(io.Discard, io.LimitReader(res.Body, 1<<20))

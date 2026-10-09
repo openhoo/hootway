@@ -22,16 +22,33 @@ func splitRoute(escaped string) (name, rest string, err error) {
 	} else {
 		name, rest = trimmed, "/"
 	}
-	for s := rest[1:]; ; {
-		seg, more := nextSegment(&s)
-		if seg == "." || seg == ".." {
-			return "", "", errUnsafePath
-		}
-		if !more {
-			break
-		}
+	if hasDotSegment(rest) {
+		return "", "", errUnsafePath
 	}
 	return name, rest, nil
+}
+
+// checkPath applies the same rejections as splitRoute to a complete escaped
+// path, for proxy requests that carry no route prefix.
+func checkPath(escaped string) error {
+	if !strings.HasPrefix(escaped, "/") || hasUnsafeEncoding(escaped) || hasDotSegment(escaped) {
+		return errUnsafePath
+	}
+	return nil
+}
+
+// hasDotSegment reports whether the "/"-prefixed path p has a "." or ".."
+// segment.
+func hasDotSegment(p string) bool {
+	for s := p[1:]; ; {
+		seg, more := nextSegment(&s)
+		if seg == "." || seg == ".." {
+			return true
+		}
+		if !more {
+			return false
+		}
+	}
 }
 
 // hasUnsafeEncoding reports whether p contains %2f, %5c, %2e, %3b or %00 in

@@ -8,15 +8,17 @@ import (
 // Event is one gateway request as shown in the console. It never contains
 // key values, credentials, query strings or bodies.
 type Event struct {
-	Seq        uint64    `json:"seq"`
-	Time       time.Time `json:"time"`
-	Key        string    `json:"key"`
-	Upstream   string    `json:"upstream"`
-	Method     string    `json:"method"`
-	Path       string    `json:"path"`
-	Status     int       `json:"status"`
-	Outcome    string    `json:"outcome"`
-	DurationMS int64     `json:"duration_ms"`
+	Seq      uint64    `json:"seq"`
+	Time     time.Time `json:"time"`
+	Key      string    `json:"key"`
+	Upstream string    `json:"upstream"`
+	Method   string    `json:"method"`
+	Path     string    `json:"path"`
+	Status   int       `json:"status"`
+	Outcome  string    `json:"outcome"`
+	// Proxy marks requests that used the gateway as an HTTP(S) proxy.
+	Proxy      bool  `json:"proxy,omitempty"`
+	DurationMS int64 `json:"duration_ms"`
 }
 
 // KeyStats aggregates requests per key since start.
@@ -49,16 +51,18 @@ func newEventLog(n int) *eventLog {
 
 func (l *eventLog) add(e Event) {
 	forwarded := e.Outcome == "forwarded"
+	tunnel := e.Outcome == "tunnel" // an opened CONNECT tunnel is neither
 	l.mu.Lock()
 	l.seq++
 	e.Seq = l.seq
 	l.buf[(l.seq-1)%uint64(len(l.buf))] = e
-	if forwarded {
+	switch {
+	case forwarded:
 		l.total.forwarded++
-	} else {
+	case !tunnel:
 		l.total.denied++
 	}
-	if e.Key != "" {
+	if e.Key != "" && !tunnel {
 		s := l.stats[e.Key]
 		if s == nil {
 			s = &keyStats{}

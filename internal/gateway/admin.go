@@ -410,7 +410,17 @@ func (a *AdminServer) state() any {
 		ups = append(ups, stateUpstream{Upstream: u, Problem: problems[u.Name]})
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i].ID < keys[j].ID })
+	outbound := ""
+	if op := cfg.OutboundProxy; op != nil {
+		outbound = "direct, no proxy"
+		if !op.Direct && op.parsed != nil {
+			outbound = op.parsed.String()
+		}
+	}
 	return map[string]any{
+		"proxy":          cfg.Proxy != nil,
+		"proxy_https":    a.gw.state.Load().ca != nil,
+		"outbound_proxy": outbound,
 		"gateway_url":    a.gatewayURL,
 		"persistent":     a.path != "",
 		"secret_storage": a.path != "",

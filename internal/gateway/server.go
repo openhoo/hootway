@@ -15,6 +15,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,7 +41,14 @@ type Gateway struct {
 	windows map[string]*window // by key id, survives reloads
 
 	trMu       sync.Mutex
-	transports map[time.Duration]*http.Transport // shared across reloads, by response header timeout
+	transports map[transportKey]*http.Transport // shared across reloads
+}
+
+// transportKey identifies a shared transport: response header timeout and
+// outbound route (egress.id may contain proxy credentials; memory only).
+type transportKey struct {
+	timeout time.Duration
+	egress  string
 }
 
 type runtimeState struct {
@@ -48,6 +56,11 @@ type runtimeState struct {
 	upstreams map[string]*route
 	keys      map[[sha256.Size]byte]*runtimeKey // by SHA-256 of the virtual key
 	problems  map[string]string
+	// origins indexes routes by scheme://host:port for proxy requests,
+	// longest base path first.
+	origins map[string][]*route
+	ca      *proxyCA // nil unless proxy mode has a usable CA
+	caErr   error
 }
 
 // runtimeKey is a configured key with its grants compiled and its rate
@@ -62,7 +75,9 @@ type runtimeKey struct {
 type route struct {
 	up       Upstream
 	basePath string
+	escBase  string // escaped base path, for matching proxy request paths
 	cred     credential
+	egress   egress
 	err      error
 	proxy    *httputil.ReverseProxy
 }
@@ -118,17 +133,23 @@ func New(cfg *Config, opts Options) (*Gateway, error) {
 		opts.Now = time.Now
 	}
 	g := &Gateway{log: opts.Logger, now: opts.Now, getenv: opts.Getenv, transport: opts.Transport,
-		events: newEventLog(1000), windows: map[string]*window{}, transports: map[time.Duration]*http.Transport{}}
+		events: newEventLog(1000), windows: map[string]*window{}, transports: map[transportKey]*http.Transport{}}
 	st := g.build(cfg)
-	if len(st.problems) > 0 && !opts.Lenient {
+	if (len(st.problems) > 0 || st.caErr != nil) && !opts.Lenient {
 		var errs []error
 		for name, p := range st.problems {
 			errs = append(errs, fmt.Errorf("upstream %q: %s", name, p))
+		}
+		if st.caErr != nil {
+			errs = append(errs, fmt.Errorf("proxy: %w", st.caErr))
 		}
 		return nil, errors.Join(errs...)
 	}
 	for name, p := range st.problems {
 		opts.Logger.Warn("upstream credential unavailable", "upstream", name, "problem", p)
+	}
+	if st.caErr != nil {
+		opts.Logger.Warn("proxy CA unavailable; https proxying is disabled", "problem", st.caErr.Error())
 	}
 	g.state.Store(st)
 	return g, nil
@@ -149,14 +170,23 @@ func (g *Gateway) Config() *Config { return g.state.Load().cfg }
 func (g *Gateway) Problems() map[string]string { return g.state.Load().problems }
 
 func (g *Gateway) build(cfg *Config) *runtimeState {
-	st := &runtimeState{cfg: cfg, upstreams: map[string]*route{}, keys: make(map[[sha256.Size]byte]*runtimeKey, len(cfg.Keys)), problems: map[string]string{}}
+	st := &runtimeState{cfg: cfg, upstreams: map[string]*route{}, keys: make(map[[sha256.Size]byte]*runtimeKey, len(cfg.Keys)),
+		problems: map[string]string{}, origins: map[string][]*route{}}
+	if cfg.Proxy != nil && cfg.Proxy.CACertFile != "" {
+		st.ca, st.caErr = loadProxyCA(cfg.Proxy.CACertFile, cfg.Proxy.CAKeyFile)
+	}
 	for _, up := range cfg.Upstreams {
 		r := &route{up: up}
 		if up.base != nil {
 			r.basePath = up.base.Path
+			r.escBase = strings.TrimRight(up.base.EscapedPath(), "/")
+			o := originKey(up.base.Scheme, up.base.Host)
+			st.origins[o] = append(st.origins[o], r)
 		}
-		r.cred, r.err = resolveCredential(up.Auth, g.getenv)
-		if r.err != nil {
+		var credErr, egErr error
+		r.cred, credErr = resolveCredential(up.Auth, g.getenv)
+		r.egress, egErr = resolveEgress(up.OutboundProxy, cfg.OutboundProxy, g.getenv)
+		if r.err = errors.Join(credErr, egErr); r.err != nil {
 			st.problems[up.Name] = r.err.Error()
 		}
 		timeout := time.Duration(up.TimeoutSeconds) * time.Second
@@ -165,7 +195,7 @@ func (g *Gateway) build(cfg *Config) *runtimeState {
 		}
 		transport := g.transport
 		if transport == nil {
-			transport = g.sharedTransport(timeout)
+			transport = g.sharedTransport(timeout, r.egress)
 		}
 		name := up.Name
 		r.proxy = &httputil.ReverseProxy{
@@ -181,6 +211,9 @@ func (g *Gateway) build(cfg *Config) *runtimeState {
 			},
 		}
 		st.upstreams[up.Name] = r
+	}
+	for _, rs := range st.origins {
+		sort.SliceStable(rs, func(i, j int) bool { return len(rs[i].escBase) > len(rs[j].escBase) })
 	}
 	g.limMu.Lock()
 	live := make(map[string]bool, len(cfg.Keys))
@@ -212,16 +245,18 @@ func (g *Gateway) build(cfg *Config) *runtimeState {
 }
 
 // sharedTransport returns the gateway-owned transport for a response header
-// timeout. Transports are reused across configuration reloads so connection
-// pools are kept warm and old pools are not leaked on every Apply.
-func (g *Gateway) sharedTransport(timeout time.Duration) *http.Transport {
+// timeout and outbound route. Transports are reused across configuration
+// reloads so connection pools are kept warm and old pools are not leaked on
+// every Apply.
+func (g *Gateway) sharedTransport(timeout time.Duration, eg egress) *http.Transport {
 	g.trMu.Lock()
 	defer g.trMu.Unlock()
-	if t := g.transports[timeout]; t != nil {
+	tk := transportKey{timeout, eg.id}
+	if t := g.transports[tk]; t != nil {
 		return t
 	}
 	t := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 eg.proxy,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: timeout,
@@ -231,7 +266,7 @@ func (g *Gateway) sharedTransport(timeout time.Duration) *http.Transport {
 		IdleConnTimeout:       90 * time.Second,
 		ForceAttemptHTTP2:     true,
 	}
-	g.transports[timeout] = t
+	g.transports[tk] = t
 	return t
 }
 
@@ -272,12 +307,17 @@ type ctxKey struct{}
 type requestInfo struct {
 	rest    string
 	outcome string
+	proxied bool // forward-proxy request: keep absolute redirects as they are
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/healthz" {
+	if r.URL.Path == "/healthz" && !r.URL.IsAbs() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		return
+	}
+	if r.Method == http.MethodConnect {
+		g.serveConnect(w, r)
 		return
 	}
 	rs := &reqState{rec: statusRecorder{ResponseWriter: w, status: http.StatusOK}, start: g.now()}
@@ -286,6 +326,13 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Deferred so the request is recorded even when the reverse proxy aborts
 	// the handler with http.ErrAbortHandler.
 	defer g.finish(r, rs)
+	if r.URL.IsAbs() {
+		// Absolute-form request target: the client uses Hootway as an HTTP
+		// proxy for the upstream's real URL.
+		rs.ev.Proxy = true
+		g.serveProxied(rs, r, r.URL.Scheme, r.URL.Host, nil)
+		return
+	}
 	g.serve(rs, r, path)
 }
 
@@ -313,33 +360,67 @@ func (g *Gateway) finish(r *http.Request, rs *reqState) {
 }
 
 func (g *Gateway) serve(rs *reqState, r *http.Request, path string) {
-	rec, info, ev := &rs.rec, &rs.info, &rs.ev
-	presented := extractKey(r)
-	if presented == "" {
-		info.outcome = "missing_key"
-		rec.Header().Set("WWW-Authenticate", `Bearer realm="hootway"`)
-		writeStaticError(rec, http.StatusUnauthorized, errMissingKey)
-		return
-	}
 	st := g.state.Load()
-	k := st.lookupKey(presented)
-	if k == nil || k.Disabled || (k.ExpiresAt != nil && !g.now().Before(*k.ExpiresAt)) {
-		info.outcome = "invalid_key"
-		if k != nil {
-			ev.Key = k.ID
-		}
-		rec.Header().Set("WWW-Authenticate", `Bearer realm="hootway", error="invalid_token"`)
-		writeStaticError(rec, http.StatusUnauthorized, errInvalidKey)
+	k := g.authenticate(rs, st, extractKey(r), false)
+	if k == nil {
 		return
 	}
-	ev.Key = k.ID
-
 	name, rest, err := splitRoute(path)
 	if err != nil {
-		info.outcome = "bad_path"
-		writeStaticError(rec, http.StatusBadRequest, errBadPath)
+		rs.info.outcome = "bad_path"
+		writeStaticError(&rs.rec, http.StatusBadRequest, errBadPath)
 		return
 	}
+	g.forward(rs, r, st, k, name, rest)
+}
+
+// validKey returns the active key for a presented virtual key, or nil.
+func (g *Gateway) validKey(st *runtimeState, presented string) (k *runtimeKey, ok bool) {
+	k = st.lookupKey(presented)
+	return k, k != nil && !k.Disabled && (k.ExpiresAt == nil || g.now().Before(*k.ExpiresAt))
+}
+
+// authenticate checks the presented key and writes the rejection itself.
+// Proxy requests are challenged with 407 so clients send proxy credentials.
+func (g *Gateway) authenticate(rs *reqState, st *runtimeState, presented string, proxy bool) *runtimeKey {
+	rec, info := &rs.rec, &rs.info
+	status, challenge := http.StatusUnauthorized, "WWW-Authenticate"
+	if proxy {
+		status, challenge = http.StatusProxyAuthRequired, "Proxy-Authenticate"
+	}
+	if presented == "" {
+		info.outcome = "missing_key"
+		if proxy {
+			rec.Header().Set(challenge, `Basic realm="hootway"`)
+		} else {
+			rec.Header().Set(challenge, `Bearer realm="hootway"`)
+		}
+		writeStaticError(rec, status, errMissingKey)
+		return nil
+	}
+	k, ok := g.validKey(st, presented)
+	if !ok {
+		info.outcome = "invalid_key"
+		if k != nil {
+			rs.ev.Key = k.ID
+		}
+		if proxy {
+			rec.Header().Set(challenge, `Basic realm="hootway"`)
+		} else {
+			rec.Header().Set(challenge, `Bearer realm="hootway", error="invalid_token"`)
+		}
+		writeStaticError(rec, status, errInvalidKey)
+		return nil
+	}
+	rs.ev.Key = k.ID
+	return k
+}
+
+// forward enforces grants, rate limit and credential availability for an
+// authenticated request to upstream name and forwards it. Rejections never
+// reach the upstream.
+func (g *Gateway) forward(rs *reqState, r *http.Request, st *runtimeState, k *runtimeKey, name, rest string) {
+	rec, info, ev := &rs.rec, &rs.info, &rs.ev
 	ev.Upstream = name
 	rt := st.upstreams[name]
 	if rt == nil || !k.allows(name, r.Method, rest) {
@@ -392,12 +473,25 @@ func (g *Gateway) Explain(keyID, method, path string) Decision {
 	case k.ExpiresAt != nil && !g.now().Before(*k.ExpiresAt):
 		return Decision{Outcome: "invalid_key", Reason: "the key has expired"}
 	}
-	if u, err := url.Parse(path); err == nil && u.RawQuery != "" {
-		path = u.EscapedPath()
-	}
-	name, rest, err := splitRoute(path)
-	if err != nil {
-		return Decision{Outcome: "bad_path", Reason: "the path contains dot segments, // or encoded separators"}
+	var name, rest string
+	if u, err := url.Parse(path); err == nil && u.IsAbs() {
+		// A real upstream URL, as an agent would request it through proxy mode.
+		var ok bool
+		name, rest, ok = st.matchOrigin(u.Scheme, u.Host, u.EscapedPath())
+		switch {
+		case checkPath(orRoot(u.EscapedPath())) != nil:
+			return Decision{Outcome: "bad_path", Reason: "the path contains dot segments, // or encoded separators"}
+		case !ok:
+			return Decision{Outcome: "forbidden", Reason: "no upstream has this origin and base path"}
+		}
+	} else {
+		if err == nil && u.RawQuery != "" {
+			path = u.EscapedPath()
+		}
+		name, rest, err = splitRoute(path)
+		if err != nil {
+			return Decision{Outcome: "bad_path", Reason: "the path contains dot segments, // or encoded separators"}
+		}
 	}
 	rt := st.upstreams[name]
 	if rt == nil {
@@ -507,8 +601,9 @@ func (rt *route) modifyResponse(resp *http.Response) error {
 		}
 	}
 	// Keep redirects inside the gateway so the agent never needs the
-	// upstream credential to follow them.
-	if loc := resp.Header.Get("Location"); loc != "" {
+	// upstream credential to follow them. Proxy clients follow absolute
+	// redirects through the proxy themselves.
+	if loc := resp.Header.Get("Location"); loc != "" && !infoFrom(resp.Request.Context()).proxied {
 		if u, err := url.Parse(loc); err == nil && u.IsAbs() && u.Host == rt.up.base.Host && u.Scheme == rt.up.base.Scheme &&
 			strings.HasPrefix(u.EscapedPath(), rt.up.base.Path+"/") {
 			rel := "/" + rt.up.Name + strings.TrimPrefix(u.EscapedPath(), rt.up.base.Path)

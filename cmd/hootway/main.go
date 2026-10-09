@@ -33,6 +33,8 @@ Usage:
   hootway key new                       Generate a virtual key and its config hash
   hootway key hash                      Hash a virtual key read from stdin
   hootway admin token                   Generate a web console admin token and its hash
+  hootway proxy ca [-cert FILE] [-key FILE] [-days N]
+                                        Create a CA for https proxy mode
   hootway version                       Print version and commit
   hootway help                          Show this help
 
@@ -111,6 +113,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "token:  %s\nsha256: %s\n", token, hash)
 		fmt.Fprintln(stderr, "Sign in to the console with the token; store only the sha256 in admin.token_sha256.")
 		return nil
+	case "proxy":
+		if len(args) < 2 || args[1] != "ca" {
+			return usageError{"usage: hootway proxy ca [-cert FILE] [-key FILE] [-days N]"}
+		}
+		return proxyCA(args[2:], stdout, stderr)
 	case "version", "-v", "--version":
 		fmt.Fprintf(stdout, "hootway %s (%s)\n", version, commit)
 		return nil
@@ -250,4 +257,27 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func proxyCA(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("hootway proxy ca", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cert := fs.String("cert", "hootway-ca.pem", "CA certificate `file` to create (give it to agent sandboxes)")
+	key := fs.String("key", "hootway-ca-key.pem", "CA private key `file` to create (0600; keep it on the gateway)")
+	days := fs.Int("days", 365, "validity in `days`")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return usageError{err.Error()}
+	}
+	if fs.NArg() > 0 || *days < 1 {
+		return usageError{"usage: hootway proxy ca [-cert FILE] [-key FILE] [-days N]"}
+	}
+	if err := gateway.GenerateProxyCA(*cert, *key, time.Duration(*days)*24*time.Hour); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "certificate: %s\nkey:         %s\n", *cert, *key)
+	fmt.Fprintln(stderr, `Set "proxy": {"ca_cert_file": …, "ca_key_file": …} in hootway.json and trust the certificate in agent sandboxes.`)
+	return nil
 }

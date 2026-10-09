@@ -211,6 +211,7 @@ function renderUpstreams() {
       el("div", { class: "item-meta" },
         el("span", { class: "mono" }, u.base_url),
         el("span", {}, `${u.auth.type}${src ? " · " + src : ""}`),
+        u.outbound_proxy ? el("span", {}, u.outbound_proxy.direct ? "direct" : `via ${u.outbound_proxy.url}`) : null,
         el("span", {}, `${users} key${users === 1 ? "" : "s"}`)),
       u.problem ? el("p", { class: "error" }, u.problem) : null);
   }));
@@ -308,10 +309,21 @@ function showSecret(key, upstream, hint) {
   const p = hint?.env || "HOOTWAY";
   const curl = hint?.test ? `curl -H "Authorization: Bearer $${p}_TOKEN" "$${p}_URL${hint.test}"`
     : `curl -H "Authorization: Bearer $${p}_TOKEN" "$${p}_URL/…"`;
-  $("#secret-snippet").textContent =
+  let snippet =
 `export ${p}_URL=${base}
 export ${p}_TOKEN=${key}
 ${curl}`;
+  const up = state.data.upstreams.find((u) => u.name === upstream);
+  if (state.data.proxy && up) {
+    const gw = new URL(state.data.gateway_url);
+    const proxy = `${gw.protocol}//hootway:${key}@${gw.host}`;
+    snippet += `
+
+# or keep the real URL and use Hootway as proxy${up.base_url.startsWith("https:") && !state.data.proxy_https ? " (https needs a proxy CA on the gateway)" : ""}
+export HTTPS_PROXY=${proxy} HTTP_PROXY=${proxy}${up.base_url.startsWith("https:") ? "\n# trust the Hootway proxy CA: export SSL_CERT_FILE=/path/to/hootway-ca.pem" : ""}
+curl "${up.base_url.replace(/\/+$/, "")}${hint?.test || "/…"}"`;
+  }
+  $("#secret-snippet").textContent = snippet;
   $("#secret-dialog").showModal();
   $("#copy-secret").focus();
 }
@@ -359,6 +371,15 @@ function syncAuthFields() {
   for (const n of document.querySelectorAll("#up-dialog [data-auth]")) n.hidden = !n.dataset.auth.split(" ").includes(t);
 }
 $("#up-auth").addEventListener("change", syncAuthFields);
+function syncEgress() {
+  const mode = $("#up-egress").value;
+  for (const n of document.querySelectorAll("#up-dialog [data-egress]")) n.hidden = n.dataset.egress !== mode;
+  const def = state.data.outbound_proxy;
+  $("#up-egress-hint").textContent = mode === "inherit"
+    ? `Gateway default: ${def ? def : "HTTP_PROXY / HTTPS_PROXY / NO_PROXY from the gateway environment"}.`
+    : mode === "proxy" ? "http, https, socks5 or socks5h. Proxy credentials go in the config file (username + secret_env/secret_file), not in the URL." : "";
+}
+$("#up-egress").addEventListener("change", syncEgress);
 
 function openUpstream(u) {
   state.editingUpstream = u || null;
@@ -376,6 +397,10 @@ function openUpstream(u) {
   $("#up-secret").disabled = !state.data.secret_storage;
   $("#up-secret").placeholder = state.data.secret_storage ? "Paste a new token to store it on the gateway" : "Needs a writable config file";
   $("#up-headers").value = u && u.headers ? Object.entries(u.headers).map(([k, v]) => `${k}: ${v}`).join("\n") : "";
+  const op = u && u.outbound_proxy;
+  $("#up-egress").value = !op ? "inherit" : op.direct ? "direct" : "proxy";
+  $("#up-proxy-url").value = op && op.url ? op.url : "";
+  syncEgress();
   $("#up-delete").hidden = !u;
   syncAuthFields(); setError("#up-error");
   $("#up-dialog").showModal();
@@ -404,6 +429,12 @@ $("#up-form").addEventListener("submit", async (e) => {
   }
   const body = { name, base_url: v("#up-url"), description: v("#up-desc"), auth, timeout_seconds: parseInt($("#up-timeout").value || "0", 10) || 0 };
   if (Object.keys(headers).length) body.headers = headers;
+  const egress = $("#up-egress").value;
+  if (egress === "direct") body.outbound_proxy = { direct: true };
+  if (egress === "proxy") {
+    const prev = state.editingUpstream && state.editingUpstream.outbound_proxy;
+    body.outbound_proxy = { ...(prev && !prev.direct ? prev : {}), url: v("#up-proxy-url") };
+  }
   if (secret) body.secret = secret;
   await busy($("#up-save"), async () => {
     try {
@@ -444,22 +475,23 @@ $("#activity-filter").addEventListener("change", () => renderEvents());
 const outcomeText = {
   forwarded: "forwarded", forbidden: "not allowed", invalid_key: "invalid key", missing_key: "no key",
   bad_path: "unsafe path", rate_limited: "rate limited", upstream_error: "upstream failed", upstream_unconfigured: "no credential",
+  tunnel: "tunnel opened",
 };
 function renderEvents() {
   const f = $("#activity-filter").value;
   if (state.shown === state.lastSeq + f) return;
   state.shown = state.lastSeq + f;
-  const list = state.events.filter((e) => !f || (f === "forwarded") === (e.outcome === "forwarded")).slice().reverse();
+  const list = state.events.filter((e) => !f || (f === "proxy" ? e.proxy : (f === "forwarded") === (e.outcome === "forwarded"))).slice().reverse();
   const log = $("#activity");
   if (!list.length) {
     log.replaceChildren(empty(f ? "Nothing matches this filter" : "Quiet so far", "Requests from agents appear here as they happen."));
     return;
   }
   log.replaceChildren(...list.slice(0, 200).map((e) => {
-    const ok = e.outcome === "forwarded";
+    const ok = e.outcome === "forwarded" || e.outcome === "tunnel";
     return el("div", { class: "ev" + (ok ? "" : " denied") },
       el("span", { class: "t" }, new Date(e.time).toLocaleTimeString()),
-      el("span", { class: "m" }, e.method),
+      el("span", { class: "m", title: e.proxy ? "via proxy" : null }, e.method + (e.proxy ? " ⇄" : "")),
       el("span", { class: "p" }, e.path, e.key ? el("span", { class: "k" }, e.key) : null),
       el("span", { class: "o" }, el("span", { class: "pill" + (ok ? "" : e.outcome === "upstream_error" ? " warn" : " bad") },
         `${e.status} ${outcomeText[e.outcome] || e.outcome}`)));

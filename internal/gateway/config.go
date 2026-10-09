@@ -17,10 +17,24 @@ import (
 // secrets or virtual keys in plaintext: secrets are read from environment
 // variables or files, and keys are stored as SHA-256 hashes.
 type Config struct {
-	Listen    string     `json:"listen"`
-	Admin     *Admin     `json:"admin,omitempty"`
-	Upstreams []Upstream `json:"upstreams"`
-	Keys      []Key      `json:"keys"`
+	Listen string `json:"listen"`
+	Admin  *Admin `json:"admin,omitempty"`
+	// Proxy additionally lets agents use the gateway listener as an HTTP(S)
+	// proxy for the upstreams' real URLs.
+	Proxy *ProxyMode `json:"proxy,omitempty"`
+	// OutboundProxy routes connections to all upstreams through a proxy.
+	OutboundProxy *OutboundProxy `json:"outbound_proxy,omitempty"`
+	Upstreams     []Upstream     `json:"upstreams"`
+	Keys          []Key          `json:"keys"`
+}
+
+// ProxyMode enables forward-proxy requests on the gateway listener. Plain
+// http:// targets need nothing else; https:// targets (CONNECT) are
+// intercepted with leaf certificates issued by the configured CA so that the
+// same policy applies. Only hosts of configured upstreams are reachable.
+type ProxyMode struct {
+	CACertFile string `json:"ca_cert_file,omitempty"`
+	CAKeyFile  string `json:"ca_key_file,omitempty"`
 }
 
 // Admin configures the web console and admin API. It is served on its own
@@ -43,6 +57,8 @@ type Upstream struct {
 	Headers map[string]string `json:"headers,omitempty"`
 	// TimeoutSeconds bounds a single upstream round trip. Default 60.
 	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+	// OutboundProxy overrides the top-level outbound_proxy for this upstream.
+	OutboundProxy *OutboundProxy `json:"outbound_proxy,omitempty"`
 
 	base *url.URL
 }
@@ -136,6 +152,14 @@ func (c *Config) validate() error {
 			errs = append(errs, errors.New("admin: token_sha256 must be 64 lowercase hex characters"))
 		}
 	}
+	if c.Proxy != nil && (c.Proxy.CACertFile == "") != (c.Proxy.CAKeyFile == "") {
+		errs = append(errs, errors.New("proxy: set both ca_cert_file and ca_key_file, or neither"))
+	}
+	if c.OutboundProxy != nil {
+		if err := c.OutboundProxy.validate(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if c.Upstreams == nil {
 		c.Upstreams = []Upstream{}
 	}
@@ -169,6 +193,11 @@ func (c *Config) validate() error {
 				errs = append(errs, fmt.Errorf("upstream %q: header %q cannot be set statically", u.Name, h))
 			} else if !validHeaderName(h) || strings.ContainsAny(u.Headers[h], "\r\n\x00") {
 				errs = append(errs, fmt.Errorf("upstream %q: header %q has an invalid name or value", u.Name, h))
+			}
+		}
+		if u.OutboundProxy != nil {
+			if err := u.OutboundProxy.validate(); err != nil {
+				errs = append(errs, fmt.Errorf("upstream %q: %w", u.Name, err))
 			}
 		}
 		if u.TimeoutSeconds < 0 {
