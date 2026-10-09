@@ -188,6 +188,8 @@ func (a *AdminServer) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, a.gw.Explain(req.Key, strings.ToUpper(strings.TrimSpace(req.Method)), strings.TrimSpace(req.Path)))
+	case path == "/probe" && r.Method == http.MethodPost:
+		a.probe(w, r)
 	case path == "/keys" && r.Method == http.MethodPost:
 		a.createKey(w, r)
 	case len(parts) == 2 && parts[0] == "keys" && r.Method == http.MethodPut:
@@ -216,28 +218,10 @@ func (a *AdminServer) api(w http.ResponseWriter, r *http.Request) {
 			return map[string]string{"id": parts[1], "key": key}, nil
 		})
 	case len(parts) == 2 && parts[0] == "upstreams" && r.Method == http.MethodPut:
-		var up Upstream
-		if !decode(w, r, &up) {
-			return
-		}
-		name := parts[1]
-		a.mutate(w, func(c *Config) (any, error) {
-			if up.Name == "" {
-				up.Name = name
-			}
-			if up.Name != name {
-				return nil, errors.New("the body name must match the URL; renaming an upstream is not supported")
-			}
-			i := upstreamIndex(c, name)
-			if i < 0 {
-				c.Upstreams = append(c.Upstreams, up)
-				return up, nil
-			}
-			c.Upstreams[i] = up
-			return up, nil
-		})
+		a.putUpstream(w, r, parts[1])
 	case len(parts) == 2 && parts[0] == "upstreams" && r.Method == http.MethodDelete:
-		a.mutate(w, func(c *Config) (any, error) {
+		var removed string
+		a.mutateThen(w, func(c *Config) (any, error) {
 			i := upstreamIndex(c, parts[1])
 			if i < 0 {
 				return nil, errNotFound
@@ -249,8 +233,13 @@ func (a *AdminServer) api(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
+			removed = c.Upstreams[i].Auth.SecretFile
 			c.Upstreams = append(c.Upstreams[:i], c.Upstreams[i+1:]...)
 			return map[string]string{"deleted": parts[1]}, nil
+		}, func(ok bool) {
+			if ok {
+				a.removeManagedSecret(removed)
+			}
 		})
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "unknown endpoint")
@@ -315,8 +304,18 @@ var errNotFound = errors.New("not found")
 // mutate applies fn to a copy of the configuration, validates it, persists it
 // and only then activates it.
 func (a *AdminServer) mutate(w http.ResponseWriter, fn func(*Config) (any, error)) {
+	a.mutateThen(w, fn, nil)
+}
+
+// mutateThen is mutate with a callback, run under the lock, that learns
+// whether the new configuration became active.
+func (a *AdminServer) mutateThen(w http.ResponseWriter, fn func(*Config) (any, error), done func(ok bool)) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	ok := false
+	if done != nil {
+		defer func() { done(ok) }()
+	}
 	next, err := a.gw.Config().clone()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "could not copy configuration")
@@ -339,6 +338,7 @@ func (a *AdminServer) mutate(w http.ResponseWriter, fn func(*Config) (any, error
 		return
 	}
 	a.gw.Apply(next)
+	ok = true
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -411,11 +411,12 @@ func (a *AdminServer) state() any {
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i].ID < keys[j].ID })
 	return map[string]any{
-		"gateway_url": a.gatewayURL,
-		"persistent":  a.path != "",
-		"upstreams":   ups,
-		"keys":        keys,
-		"totals":      map[string]int64{"forwarded": fwd, "denied": denied},
+		"gateway_url":    a.gatewayURL,
+		"persistent":     a.path != "",
+		"secret_storage": a.path != "",
+		"upstreams":      ups,
+		"keys":           keys,
+		"totals":         map[string]int64{"forwarded": fwd, "denied": denied},
 	}
 }
 

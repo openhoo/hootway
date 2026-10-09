@@ -1,6 +1,14 @@
 Hootway lets agent sandboxes call logged-in APIs such as Jira with scoped virtual keys instead of real credentials.
 
-## Changes since 0.2.0
+## Changes in 0.3.0
+
+### New key presets
+
+- New key wizard with presets for Jira, Confluence, Bitbucket (Cloud and Data Center), GitLab, GitHub (incl. Enterprise Server), Gitea/Forgejo, Linear, Plane, Sentry, Grafana and Notion: choose cloud or self-hosted, get sent to the right (prefilled where supported) token page, paste and test the token, then create a scoped key
+- The console can store a pasted upstream token write-only in a `0600` file under `secrets/` next to the config; replaced or deleted upstreams remove their managed file
+- `POST /api/probe` tests a saved or draft upstream credential with one `GET` and returns only the status
+
+## Changes in 0.2.1
 
 - The signed multi-arch image is now also published to Docker Hub: `docker pull openhoo/hootway` (same digest as `ghcr.io/openhoo/hootway`)
 
