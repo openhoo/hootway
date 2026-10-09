@@ -254,3 +254,4 @@ a.button.primary:hover { filter: brightness(1.06); }
   .grant.fixed .g-paths { grid-column: 1 / -1; }
   .steps > li { padding-left: 38px; }
 }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
