@@ -1,5 +1,10 @@
 Hootway lets agent sandboxes call logged-in APIs such as Jira with scoped virtual keys instead of real credentials.
 
+## Changes in 0.4.1
+
+- Activity announces proxied requests as "via proxy" to screen readers instead of reading the arrow glyph
+- Refreshed console screenshots for proxy mode and outbound proxies; container image size updated in the README
+
 ## Changes in 0.4.0
 
 ### Proxy mode
