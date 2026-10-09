@@ -517,7 +517,9 @@ function fieldValues() {
   for (const f of variantOf().fields) {
     const raw = ($("#wf-" + f.id)?.value || "").trim();
     if (f.kind === "site") {
-      const site = raw.replace(/^https?:\/\//i, "").replace(new RegExp(f.suffix.replace(/\./g, "\\.") + ".*$", "i"), "").toLowerCase();
+      let site = raw.replace(/^https?:\/\//i, "").toLowerCase();
+      const cut = site.indexOf(f.suffix);
+      if (cut >= 0) site = site.slice(0, cut);
       if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(site)) throw new Error(`${f.label}: enter the name before ${f.suffix}.`);
       out[f.id] = site;
     } else if (f.kind === "url") {
