@@ -15,6 +15,7 @@ Hootway lets agent sandboxes call logged-in APIs such as Jira with scoped virtua
 - Require one JSON object with unique field names; reject ambiguous, trailing and oversized admin requests without reflecting credentials in parsing errors
 - Reject invalid method tokens, unsafe base URLs and duration overflow; reject mismatched key update IDs and ambiguous credential probes
 - Preserve shared upstream/proxy secret files and manually managed credentials during cleanup; reject symlink custody directories and enforce private directory permissions
+- Bound file/environment credentials to 8 KiB, reject device and FIFO sources without blocking, and preserve operator-selected files and mounted-secret aliases
 - Preserve escaped probe paths, report upstream 403 results accurately, and replace partial stored-key hashes with separate display fingerprints
 - Correct gzip quality negotiation and ETag matching
 
@@ -25,6 +26,7 @@ Hootway lets agent sandboxes call logged-in APIs such as Jira with scoped virtua
 - Validate quotas/timeouts as whole numbers, quote shell snippets safely, preserve unchanged expiry timestamps, improve activity errors and fix mobile rule controls
 - Correct Bitbucket API-token scope instructions and refresh desktop/mobile screenshots
 - Add 14 console regressions to CI and release verification, plus focused Go security, admin, CLI and shutdown regressions
+- Pass console test values directly to app functions instead of constructing executable test strings
 - Reject extra CLI arguments, oversized stdin keys and CA lifetime overflow; require an empty release output directory and resolve relative output paths consistently
 
 ## Changes in 0.4.1

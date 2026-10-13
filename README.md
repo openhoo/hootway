@@ -106,6 +106,9 @@ returned to the browser.
 Keep the console on localhost or behind your own TLS and access control. The
 admin API is also scriptable with `Authorization: Bearer hwa_…` and the
 `X-Hootway-Console: 1` header for writes.
+The admin token grants full gateway configuration control, including selection
+of environment variables and readable credential files. Give it only to trusted
+operators; virtual agent keys cannot access this listener.
 
 ## Configuration
 
@@ -137,6 +140,10 @@ Path patterns are upstream-relative: `*` matches exactly one segment, a final
 unknown fields, unknown upstreams and malformed grants fail `hootway check`.
 The config must contain one JSON object with unique field names. Base paths
 and grants use the same unsafe-path checks as incoming requests.
+Credential values from files or environment variables must be single-line and
+at most 8 KiB. Files must be regular files of at most 8 KiB plus two bytes for
+terminal CR/LF; operator-selected paths and mounted-secret symlink aliases are
+supported. Devices and named pipes are rejected before reading.
 
 ## Proxy mode
 

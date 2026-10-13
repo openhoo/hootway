@@ -4,9 +4,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
+	"syscall"
 )
 
 // credential is a resolved, ready-to-inject upstream credential.
@@ -56,7 +58,7 @@ func readSecret(env, file string, getenv func(string) string) (string, error) {
 			return "", fmt.Errorf("environment variable %s is empty", env)
 		}
 	} else {
-		data, err := os.ReadFile(file)
+		data, err := readCredentialFile(file)
 		if err != nil {
 			return "", fmt.Errorf("read secret file: %w", err)
 		}
@@ -65,7 +67,53 @@ func readSecret(env, file string, getenv func(string) string) (string, error) {
 	if v == "" || strings.ContainsAny(v, "\r\n\x00") {
 		return "", errors.New("secret is empty or contains line breaks")
 	}
+	if len(v) > maxSecretLen {
+		return "", errors.New("secret exceeds 8 KiB")
+	}
 	return v, nil
+}
+
+// File paths are intentionally selected by the operator (including absolute
+// paths and symlink aliases), not by gateway callers. A credential source must
+// be a bounded regular file: never open a device or block on a named pipe.
+func readCredentialFile(path string) ([]byte, error) {
+	const maxFileLen = maxSecretLen + 2 // allow a terminal CRLF at the value limit
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, errors.New("the credential source must be a regular file")
+	}
+	if st.Size() > maxFileLen {
+		return nil, errors.New("credential file exceeds 8 KiB plus a terminal CRLF")
+	}
+	// Recheck the opened object as well. O_NONBLOCK keeps a raced replacement
+	// with a FIFO from hanging before that recheck; it does not affect regular
+	// file reads (and is ignored by Windows' ordinary file opener).
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !opened.Mode().IsRegular() {
+		return nil, errors.New("the credential source must be a regular file")
+	}
+	if !os.SameFile(st, opened) {
+		return nil, errors.New("the credential file changed while opening")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxFileLen+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxFileLen {
+		return nil, errors.New("credential file exceeds 8 KiB plus a terminal CRLF")
+	}
+	return data, nil
 }
 
 func (c credential) apply(r *http.Request) {
