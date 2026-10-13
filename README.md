@@ -103,8 +103,10 @@ without a restart. Light and dark themes follow the system and can be toggled.
 "current user" endpoint and reports only the status; no response body is
 returned to the browser.
 
-Keep the console on localhost or behind your own TLS and access control. The
-admin API is also scriptable with `Authorization: Bearer hwa_…` and the
+Keep the console on localhost or behind your own TLS and access control.
+Configure an HTTPS reverse proxy to send `X-Forwarded-Proto: https` so login and logout
+cookies are marked Secure. Console cookies also use HttpOnly and SameSite=Strict.
+The admin API is also scriptable with `Authorization: Bearer hwa_…` and the
 `X-Hootway-Console: 1` header for writes.
 The admin token grants full gateway configuration control, including selection
 of environment variables and readable credential files. Give it only to trusted

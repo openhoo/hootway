@@ -2,8 +2,11 @@ package gateway
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +14,92 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestSecondAdminCookiesProtectTLSAndPreserveLocalHTTP(t *testing.T) {
+	_, gw, path := newConsole(t, "https://example.com")
+	for _, tc := range []struct {
+		name, forwarded string
+		tls, wantSecure bool
+	}{
+		{"local HTTP", "", false, false},
+		{"forwarded HTTP", "http", false, false},
+		{"TLS offload", "https", false, true},
+		{"TLS offload case and whitespace", " HTTPS ", false, true},
+		{"direct TLS", "", true, true},
+		{"direct TLS cannot be downgraded", "http", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := NewAdmin(gw, path, HashKey(adminToken), "http://gw")
+			request := func(method string, body io.Reader, session *http.Cookie) *httptest.ResponseRecorder {
+				req := httptest.NewRequest(method, "/api/session", body)
+				req.Header.Set("X-Hootway-Console", "1")
+				if tc.forwarded != "" {
+					req.Header.Set("X-Forwarded-Proto", tc.forwarded)
+				}
+				if tc.tls {
+					req.TLS = &tls.ConnectionState{}
+				}
+				if session != nil {
+					req.AddCookie(session)
+				}
+				rec := httptest.NewRecorder()
+				a.ServeHTTP(rec, req)
+				if rec.Code != 200 {
+					t.Fatalf("%s status = %d", method, rec.Code)
+				}
+				return rec
+			}
+			login := request("POST", strings.NewReader(`{"token":"`+adminToken+`"}`), nil)
+			cookies := login.Result().Cookies()
+			if len(cookies) != 1 || cookies[0].Secure != tc.wantSecure || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
+				t.Fatal("login cookie does not preserve the requested TLS protection and session restrictions")
+			}
+			logout := request("DELETE", nil, cookies[0])
+			deleted := logout.Result().Cookies()
+			if len(deleted) != 1 || deleted[0].Secure != tc.wantSecure || deleted[0].Value != "" || deleted[0].MaxAge >= 0 {
+				t.Fatal("logout cookie does not match the login cookie's protection")
+			}
+			auth := httptest.NewRequest("GET", "/api/state", nil)
+			auth.AddCookie(cookies[0])
+			if a.authenticated(auth) {
+				t.Fatal("logout did not revoke the session")
+			}
+		})
+	}
+}
+
+func TestSecondStructuredAuditEscapesForgedLogFields(t *testing.T) {
+	for _, format := range []string{"JSON", "text"} {
+		t.Run(format, func(t *testing.T) {
+			_, gw, _ := newConsole(t, "https://example.com")
+			var logs bytes.Buffer
+			if format == "JSON" {
+				gw.log = slog.New(slog.NewJSONHandler(&logs, nil))
+			} else {
+				gw.log = slog.New(slog.NewTextHandler(&logs, nil))
+			}
+			const forged = "synthetic\r\n{\"msg\":\"forged\"}\t\x1b[31m"
+			req := httptest.NewRequest("GET", "/jira/check", nil)
+			rs := &reqState{ev: Event{Key: forged, Upstream: forged, Method: forged, Path: forged}, start: gw.now(), state: gw.state.Load()}
+			rs.info.outcome = "forbidden"
+			rs.rec.status = http.StatusForbidden
+			gw.finish(req, rs)
+			if bytes.Count(logs.Bytes(), []byte{'\n'}) != 1 || bytes.Contains(logs.Bytes(), []byte{'\r'}) || bytes.Contains(logs.Bytes(), []byte{0x1b}) {
+				t.Fatal("audit values injected physical log lines or terminal controls")
+			}
+			if format == "JSON" {
+				dec := json.NewDecoder(&logs)
+				var record map[string]any
+				if err := dec.Decode(&record); err != nil || record["msg"] != "request" || record["method"] != forged || record["path"] != forged || record["key"] != forged || record["upstream"] != forged {
+					t.Fatal("structured field encoding did not preserve the intended log record")
+				}
+				if err := dec.Decode(&record); err != io.EOF {
+					t.Fatal("audit fields injected a second structured log record")
+				}
+			}
+		})
+	}
+}
 
 func TestSecondAdminLoginReplacesOnlyCurrentBrowserSession(t *testing.T) {
 	_, gw, path := newConsole(t, "https://example.com")

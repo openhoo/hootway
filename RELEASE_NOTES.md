@@ -12,6 +12,7 @@ Hootway lets agent sandboxes call logged-in APIs such as Jira with scoped virtua
 ### Admin and console
 
 - Repeated login replaces the current browser's old session; keep at most 256 browser sessions and retire the oldest at capacity
+- Mark login and logout cookies Secure for direct TLS and HTTPS reverse proxies using `X-Forwarded-Proto: https`, while preserving localhost HTTP sessions
 - Clean up managed outbound-proxy passwords when their upstream is replaced or deleted, preserving shared references and credentials after failed changes
 - Keep draft probe passwords separate from environment-backed Basic usernames
 - Give gzip and plain console assets separate strong ETags, handle repeated encoding/cache headers, and return 406 when both representations are refused

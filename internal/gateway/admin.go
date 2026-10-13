@@ -540,7 +540,7 @@ func (a *AdminServer) login(w http.ResponseWriter, r *http.Request) {
 	a.sessions[HashKey(sid)] = now.Add(12 * time.Hour)
 	a.sessMu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: sid, Path: "/", HttpOnly: true,
-		SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil, MaxAge: 12 * 3600})
+		SameSite: http.SameSiteStrictMode, Secure: secureAdminCookie(r), MaxAge: 12 * 3600})
 	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
 }
 
@@ -550,8 +550,16 @@ func (a *AdminServer) logout(w http.ResponseWriter, r *http.Request) {
 		delete(a.sessions, HashKey(c.Value))
 		a.sessMu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true,
+		SameSite: http.SameSiteStrictMode, Secure: secureAdminCookie(r)})
 	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
+}
+
+// TLS termination may happen at an operator's reverse proxy. Its protocol
+// header can opt into Secure, but cannot disable direct TLS protection. Plain
+// localhost HTTP remains supported without a forwarded HTTPS indication.
+func secureAdminCookie(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
 }
 
 func (a *AdminServer) authenticated(r *http.Request) bool {
