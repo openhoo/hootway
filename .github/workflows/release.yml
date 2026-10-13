@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     tags: ['v*.*.*']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,6 +19,7 @@ concurrency:
 jobs:
   binaries:
     name: Release binaries
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -81,6 +83,7 @@ jobs:
 
   container:
     name: Release container
+    if: github.event_name == 'push'
     # Publish the image only after the tagged revision passed verification.
     needs: binaries
     runs-on: ubuntu-latest
@@ -165,3 +168,22 @@ jobs:
           repository: openhoo/hootway
           short-description: Credential-injecting API gateway that gives agent sandboxes scoped virtual keys instead of real API tokens.
           enable-url-completion: true
+
+  metadata:
+    name: Update Docker Hub metadata
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify metadata helper
+        run: python3 -m unittest discover -s scripts -p 'dockerhub_metadata_test.py'
+      - name: Update Docker Hub repository information
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: python3 scripts/dockerhub-metadata.py

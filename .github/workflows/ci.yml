@@ -35,6 +35,8 @@ jobs:
         run: go vet ./...
       - name: Release version regressions
         run: bash scripts/release.test.sh
+      - name: Docker Hub metadata regressions
+        run: python3 -m unittest discover -s scripts -p 'dockerhub_metadata_test.py'
       - name: Console regressions
         run: |
           node --check internal/gateway/web/app.js
