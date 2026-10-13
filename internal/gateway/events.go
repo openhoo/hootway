@@ -83,6 +83,9 @@ func (l *eventLog) since(after uint64, limit int) []Event {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	n := uint64(len(l.buf))
+	if after >= l.seq || limit <= 0 {
+		return []Event{}
+	}
 	oldest := uint64(1)
 	if l.seq > n {
 		oldest = l.seq - n + 1

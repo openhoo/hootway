@@ -42,13 +42,68 @@ func (a *AdminServer) secretDir() string {
 // managedSecret reports whether file was written by the console.
 func (a *AdminServer) managedSecret(file string) bool {
 	dir := a.secretDir()
-	return dir != "" && file != "" && filepath.Dir(filepath.Clean(file)) == dir
+	if dir == "" || file == "" {
+		return false
+	}
+	if st, err := os.Lstat(dir); err != nil || !st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return false
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(filepath.Clean(file)))
+	if err != nil || parent != realDir {
+		return false
+	}
+	name := filepath.Base(file)
+	// Names may contain hyphens; the random suffix is always the last part.
+	at := strings.LastIndexByte(name, '-')
+	if at < 0 {
+		return false
+	}
+	prefix, suffix := name[:at], name[at+1:]
+	if !namePattern.MatchString(prefix) || len(suffix) != 12 {
+		return false
+	}
+	_, err = hex.DecodeString(suffix)
+	return err == nil && suffix == strings.ToLower(suffix)
 }
 
 func (a *AdminServer) removeManagedSecret(file string) {
-	if a.managedSecret(file) {
-		_ = os.Remove(file)
+	if resolved, err := filepath.EvalSymlinks(file); err == nil && a.managedSecret(resolved) {
+		file = resolved
 	}
+	if !a.managedSecret(file) {
+		return
+	}
+	// A managed credential may deliberately be shared by multiple upstreams
+	// or used for proxy auth. Cleanup runs under the mutation lock after apply.
+	cfg := a.gw.Config()
+	st, _ := os.Stat(file)
+	references := func(ref string) bool {
+		if ref == "" {
+			return false
+		}
+		refPath, err := filepath.Abs(ref)
+		if err == nil && filepath.Clean(refPath) == filepath.Clean(file) {
+			return true
+		}
+		refStat, err := os.Stat(ref)
+		return st != nil && err == nil && os.SameFile(st, refStat)
+	}
+	uses := func(op *OutboundProxy) bool {
+		return op != nil && references(op.SecretFile)
+	}
+	if uses(cfg.OutboundProxy) {
+		return
+	}
+	for _, up := range cfg.Upstreams {
+		if references(up.Auth.SecretFile) || uses(up.OutboundProxy) {
+			return
+		}
+	}
+	_ = os.Remove(file)
 }
 
 func checkSecret(s string) error {
@@ -70,6 +125,16 @@ func (a *AdminServer) writeSecret(name, secret string) (string, error) {
 		return "", fmt.Errorf("upstream name must match %s", namePattern)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	st, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	if !st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("the managed secrets directory must be a real directory, not a symlink")
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
 		return "", err
 	}
 	var rnd [6]byte
@@ -169,6 +234,14 @@ func (a *AdminServer) probe(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	if (req.Name == "") == (req.Upstream == nil) {
+		writeError(w, http.StatusUnprocessableEntity, "invalid", "provide exactly one upstream name or draft upstream")
+		return
+	}
+	if req.Name != "" && req.Secret != "" {
+		writeError(w, http.StatusUnprocessableEntity, "invalid", "test a pasted secret with a draft upstream")
+		return
+	}
 	if _, rest, err := splitRoute("/x" + req.Path); err != nil || !strings.HasPrefix(req.Path, "/") || strings.ContainsAny(req.Path, "?#") || rest != req.Path {
 		writeError(w, http.StatusUnprocessableEntity, "invalid", "the test path must be a plain absolute path")
 		return
@@ -231,7 +304,7 @@ func (a *AdminServer) probe(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	out, err := http.NewRequestWithContext(ctx, http.MethodGet, up.base.Scheme+"://"+up.base.Host+up.base.Path+req.Path, nil)
+	out, err := http.NewRequestWithContext(ctx, http.MethodGet, up.base.Scheme+"://"+up.base.Host+up.base.EscapedPath()+req.Path, nil)
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, "invalid", "could not build the test request")
 		return
@@ -263,7 +336,7 @@ func (a *AdminServer) probe(w http.ResponseWriter, r *http.Request) {
 	case res.StatusCode == 401:
 		result.Message = "the upstream rejected the credential"
 	case res.StatusCode == 403:
-		result.Message = "the credential is valid but lacks permission for this check"
+		result.Message = "the upstream denied this check: verify the credential and its permissions"
 	case res.StatusCode >= 300 && res.StatusCode < 400:
 		result.Message = "the upstream redirected, usually to a login page: check the URL and credential"
 	case res.StatusCode == 404:

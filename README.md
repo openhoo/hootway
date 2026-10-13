@@ -135,6 +135,8 @@ admin API is also scriptable with `Authorization: Bearer hwa_…` and the
 Path patterns are upstream-relative: `*` matches exactly one segment, a final
 `/**` matches the prefix and everything below it. Configuration is strict:
 unknown fields, unknown upstreams and malformed grants fail `hootway check`.
+The config must contain one JSON object with unique field names. Base paths
+and grants use the same unsafe-path checks as incoming requests.
 
 ## Proxy mode
 
@@ -153,8 +155,9 @@ curl https://your-site.atlassian.net/rest/api/3/issue/ABC-1
   upstream is chosen by origin (scheme, host, port) and the longest matching
   `base_url` path; grants stay upstream-relative.
 - Hootway is **not an open proxy**: other hosts get `403 not_an_upstream`,
-  and `CONNECT` is refused unless the key is valid and the host is a
-  configured `https` upstream.
+  and `CONNECT` is refused unless the key is valid and has a grant for an upstream
+  at the configured `https` origin. At most 256 intercepted tunnels may be open
+  at once; excess connections receive `503 proxy_busy` with `Retry-After`.
 - `https://` upstreams need interception, since Hootway must see the path to
   enforce grants and must inject the credential. Create a CA once and trust
   its certificate (never the key) in the sandbox:
@@ -172,6 +175,9 @@ curl https://your-site.atlassian.net/rest/api/3/issue/ABC-1
   disabling or narrowing a key also applies to open tunnels. Without a CA,
   `CONNECT` answers `503 proxy_https_unavailable`; plain `http://` upstreams
   work without one.
+- With proxy mode disabled, absolute-form proxy requests return
+  `405 proxy_disabled`. Check reports the same outcome for real upstream URLs;
+  use the gateway's `/<upstream>/<path>` URL instead.
 - The key may be sent as proxy credentials (`Proxy-Authorization: Basic` with
   any username, or `Bearer`) or, for plain HTTP, as the usual API token.
   Proxy clients see absolute redirects unchanged and follow them through the
@@ -208,14 +214,20 @@ proxy, set `outbound_proxy`:
 
 - Requests are denied unless a grant matches. Denials never reach the upstream.
 - Paths with `..`, `.` segments, `//`, backslashes, semicolons (servlet path
-  parameters such as `..;`) or encoded `/`, `\`, `.`, `;` or NUL are rejected so the policy and the upstream see the same path.
+  parameters such as `..;`) or encoded `/`, `\`, `.`, `;`, `%` or control bytes
+  are rejected so the policy and the upstream see the same path. Rejecting
+  encoded `%` also blocks nested escapes such as `%252e`.
 - Caller `Authorization`, `Cookie`, `Proxy-Authorization`, `X-Hootway-*` and
-  `X-Forwarded-*` headers are stripped; agent-supplied query credentials are
-  overwritten for `query` auth.
+  `X-Forwarded-*` headers are stripped, together with method/path override
+  headers and request trailers; agent-supplied query credentials are overwritten
+  for `query` auth.
 - `Set-Cookie` is removed from responses so sessions cannot leak to the agent.
-  Same-origin `Location` redirects are rewritten back through Hootway.
+  Credential headers and headers containing the injected credential are also
+  removed, including informational responses and trailers. Same-origin
+  `Location` redirects are rewritten back through Hootway.
 - Logs contain key id, upstream, method, path, status, outcome and duration —
-  never key values, secrets or bodies.
+  never key values, secrets or bodies. Raw upstream transport errors are omitted
+  because they can contain credentials.
 - Hootway authorizes the HTTP shape of a request. Grant writes narrowly: an
   allowed endpoint can still do anything that endpoint does upstream.
 - Run Hootway outside the sandbox and make sure the sandbox can reach only the
@@ -256,28 +268,32 @@ exec probe.
 the console token and `HOOTWAY_PUBLIC_URL` sets the gateway URL shown in console
 snippets. Exit status is `0` on success, `1` for configuration or runtime
 errors and `2` for usage errors. `SIGINT`/`SIGTERM` stop accepting connections
-and let in-flight requests finish for up to 15 seconds; a second signal stops
-immediately.
+and let in-flight requests, including intercepted HTTPS requests, finish for
+up to 15 seconds; a second signal stops immediately. Idle proxy tunnels and
+connection pools are closed during shutdown.
 
 ## Performance & footprint
 
-Release binaries (`-s -w -trimpath`, standard library only):
+Local v0.4.2 builds with Go 1.27.2 (`-s -w -trimpath`, standard library only;
+decimal MB). Published sizes can differ with the release toolchain:
 
 | Target | Binary | gzip -9 |
 | --- | ---: | ---: |
-| linux/amd64 | 8.4 MB | 3.5 MB |
-| linux/arm64 | 7.7 MB | 3.1 MB |
-| darwin/arm64 | 8.0 MB | 3.2 MB |
-| windows/amd64 | 8.6 MB | 3.5 MB |
+| linux/amd64 | 8.5 MB | 3.5 MB |
+| linux/arm64 | 7.9 MB | 3.2 MB |
+| darwin/amd64 | 8.7 MB | 3.6 MB |
+| darwin/arm64 | 8.0 MB | 3.3 MB |
+| windows/amd64 | 8.7 MB | 3.6 MB |
 
-The container image (`scratch` + CA bundle, linux/amd64) is about 7.9 MB
-uncompressed and 3.4 MB compressed. The console is embedded precompressed (about 13.6 KB on the
-wire) and revalidated with ETags.
+The container image (`scratch` + CA bundle, linux/amd64, Go 1.26.6) is about
+8.0 MB uncompressed. The four console assets are embedded precompressed
+(about 25.5 KB total on the wire) and revalidated with ETags.
 
-Gateway work per request on an Apple M4 Max (`go test -bench`, loopback
-upstream included): a forwarded request takes about 37 µs and 8 KiB
+Historical v0.2.0 gateway measurements on an Apple M4 Max (`go test -bench`,
+loopback upstream included): a forwarded request took about 37 µs and 8 KiB
 (13 µs under parallel load); a rejected request about 1.1 µs and 5 allocations
-without touching the upstream. Grant matching and path checks do not allocate.
+without touching the upstream. These are historical reference figures; rerun
+the benchmarks below to measure the current revision on your hardware.
 
 Reproduce with:
 
@@ -298,12 +314,15 @@ scripts/compress-web.sh                                 # after editing internal
 
 ```sh
 gofmt -l . && go vet ./... && go test -race -cover ./...
+node --test scripts/console.test.mjs
 go test -run '^$' -bench . -benchtime 100x ./...   # benchmark smoke, as in CI
 ```
 
 Releases are cut by pushing a `vX.Y.Z` tag; CI builds reproducible archives
 (`scripts/build-release.sh`, needs GNU tar), signs them with Sigstore, attests
-them and publishes a multi-arch image.
+them and publishes a multi-arch image. Release builds require a clean worktree
+and an empty output directory (`DIST_DIR`, default `dist/`) so stale artifacts
+cannot be included in a new release.
 
 ## License
 

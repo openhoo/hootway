@@ -11,8 +11,9 @@ import (
 
 // credential is a resolved, ready-to-inject upstream credential.
 type credential struct {
-	auth  Auth
-	value string // header value or query value
+	auth   Auth
+	value  string // header value or query value
+	secret string // unencoded secret, retained only for response sanitising
 }
 
 func resolveCredential(a Auth, getenv func(string) string) (credential, error) {
@@ -25,7 +26,7 @@ func resolveCredential(a Auth, getenv func(string) string) (credential, error) {
 	}
 	switch a.Type {
 	case "bearer":
-		return credential{auth: a, value: "Bearer " + secret}, nil
+		return credential{auth: a, value: "Bearer " + secret, secret: secret}, nil
 	case "basic":
 		user := a.Username
 		if a.UsernameEnv != "" {
@@ -38,11 +39,11 @@ func resolveCredential(a Auth, getenv func(string) string) (credential, error) {
 			}
 		}
 		token := base64.StdEncoding.EncodeToString([]byte(user + ":" + secret))
-		return credential{auth: a, value: "Basic " + token}, nil
+		return credential{auth: a, value: "Basic " + token, secret: secret}, nil
 	case "header":
-		return credential{auth: a, value: a.Prefix + secret}, nil
+		return credential{auth: a, value: a.Prefix + secret, secret: secret}, nil
 	case "query":
-		return credential{auth: a, value: secret}, nil
+		return credential{auth: a, value: secret, secret: secret}, nil
 	}
 	return credential{}, fmt.Errorf("unknown auth type %q", a.Type)
 }
@@ -83,10 +84,12 @@ func (c credential) apply(r *http.Request) {
 // isProtectedHeader reports headers that are owned by the gateway or the
 // transport and must not be supplied statically or by credentials.
 func isProtectedHeader(h string) bool {
-	switch http.CanonicalHeaderKey(h) {
+	h = http.CanonicalHeaderKey(h)
+	switch h {
 	case "Authorization", "Proxy-Authorization", "Cookie", "Host", "Content-Length",
-		"Transfer-Encoding", "Connection", "Upgrade", "Te", "Trailer", "Keep-Alive", "Proxy-Connection":
+		"Transfer-Encoding", "Connection", "Upgrade", "Te", "Trailer", "Keep-Alive", "Proxy-Connection", "Forwarded",
+		"X-Http-Method-Override", "X-Http-Method", "X-Method-Override", "X-Original-Method", "X-Original-Url", "X-Rewrite-Url":
 		return true
 	}
-	return strings.HasPrefix(http.CanonicalHeaderKey(h), "X-Hootway-")
+	return strings.HasPrefix(h, "X-Hootway-") || strings.HasPrefix(h, "X-Forwarded-")
 }

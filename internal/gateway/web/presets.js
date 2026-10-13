@@ -78,7 +78,7 @@ const PRESETS = [
         id: "cloud", label: "Bitbucket Cloud", fields: [emailField("Atlassian account e-mail")],
         base: () => "https://api.bitbucket.org", auth: { type: "basic" }, username: (v) => v.email, test: "/2.0/user",
         token: () => ATLASSIAN_TOKENS,
-        tokenHelp: (l) => `Create API token with scopes → app Bitbucket → scopes read:user, read:repository, read:pullrequest${l === "write" ? ", write:pullrequest" : ""} → copy it.`,
+        tokenHelp: (l) => `Create API token with scopes → app Bitbucket → scopes read:user:bitbucket, read:repository:bitbucket, read:pullrequest:bitbucket${l === "write" ? ", write:pullrequest:bitbucket" : ""} → copy it.`,
         levels: {
           read: [read("/2.0/**")],
           write: [read("/2.0/**"), rw(["POST", "PUT"], "/2.0/repositories/*/*/pullrequests/**")],

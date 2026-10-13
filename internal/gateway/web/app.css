@@ -119,7 +119,7 @@ main { max-width: 920px; margin: 0 auto; padding: 44px clamp(16px, 4vw, 40px) 96
 .item-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .item-head h3 { margin: 0; font-size: 16px; font-family: var(--mono); font-weight: 500; }
 .item-head .spacer { flex: 1; }
-.item-meta { color: var(--muted); font-size: 13px; margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.item-meta { color: var(--muted); font-size: 13px; margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px 16px; overflow-wrap: anywhere; }
 .pill { font-size: 12px; padding: 2px 9px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); }
 .pill.off { background: var(--line); color: var(--muted); }
 .pill.bad { background: var(--danger-soft); color: var(--danger); }
@@ -184,9 +184,9 @@ dialog form, .secret-body { padding: 30px 30px 24px; }
   .stats { grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
   .stats div { padding: 12px; }
   .stats dd { font-size: 20px; }
-  .grant { grid-template-columns: 1fr 1fr; }
+  .grant { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
   .grant textarea { grid-column: 1 / -1; grid-row: 2; }
-  .grant .link { grid-column: 2; grid-row: 1; justify-self: end; }
+  .grant .link { grid-column: 3; grid-row: 1; justify-self: end; }
   .ev { grid-template-columns: 52px 1fr; gap: 4px 12px; }
   .ev .t { grid-row: span 2; }
   .ev .o { text-align: left; }
@@ -250,7 +250,7 @@ a.button.primary:hover { filter: brightness(1.06); }
   .tiles { grid-template-columns: 1fr 1fr; }
   .tile { flex-direction: column; align-items: flex-start; gap: 8px; }
   .choices { grid-template-columns: 1fr; }
-  .grant.fixed { grid-template-columns: 1fr 1fr; }
+  .grant.fixed { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .grant.fixed .g-paths { grid-column: 1 / -1; }
   .steps > li { padding-left: 38px; }
 }

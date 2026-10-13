@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -67,12 +68,29 @@ func (p *OutboundProxy) validate() error {
 // egress is a resolved outbound route. id identifies the transport it needs;
 // it may contain proxy credentials and is kept in memory only.
 type egress struct {
-	id    string
-	proxy func(*http.Request) (*url.URL, error)
-	desc  string // safe for display: never contains credentials
+	id            string
+	proxy         func(*http.Request) (*url.URL, error)
+	desc          string // safe for display: never contains credentials
+	secret        string // resolved proxy password, for response sanitising only
+	authorization string // outbound proxy's HTTP Basic credential; memory only
 }
 
 var envEgress = egress{id: "env", proxy: http.ProxyFromEnvironment, desc: "environment"}
+
+// Resolve credentials from environment-selected proxies as well as explicit
+// outbound_proxy configuration, so either route is covered by sanitising.
+func (eg egress) withSensitiveCredentials(target *url.URL) egress {
+	if eg.proxy == nil || target == nil || eg.authorization != "" {
+		return eg
+	}
+	u, err := eg.proxy(&http.Request{URL: target})
+	if err != nil || u == nil || u.User == nil {
+		return eg
+	}
+	eg.secret, _ = u.User.Password()
+	eg.authorization = "Basic " + base64.StdEncoding.EncodeToString([]byte(u.User.Username()+":"+eg.secret))
+	return eg
+}
 
 // resolveEgress returns the outbound route for an upstream: its own
 // outbound_proxy, else the top-level one, else the environment.
@@ -91,6 +109,7 @@ func resolveEgress(up, top *OutboundProxy, getenv func(string) string) (egress, 
 		return egress{}, errors.New("outbound proxy is not validated")
 	}
 	u := *p.parsed
+	var secret string
 	user := p.Username
 	if p.UsernameEnv != "" {
 		user = getenv(p.UsernameEnv)
@@ -108,10 +127,15 @@ func resolveEgress(up, top *OutboundProxy, getenv func(string) string) (egress, 
 				return egress{}, fmt.Errorf("outbound proxy: %w", err)
 			}
 			u.User = url.UserPassword(user, pass)
+			secret = pass
 		} else {
 			u.User = url.User(user)
 		}
 	}
 	fixed := &u
-	return egress{id: u.String(), proxy: func(*http.Request) (*url.URL, error) { return fixed, nil }, desc: p.parsed.String()}, nil
+	var authorization string
+	if user != "" {
+		authorization = "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+secret))
+	}
+	return egress{id: u.String(), proxy: func(*http.Request) (*url.URL, error) { return fixed, nil }, desc: p.parsed.String(), secret: secret, authorization: authorization}, nil
 }

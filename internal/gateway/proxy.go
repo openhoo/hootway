@@ -34,7 +34,11 @@ var (
 	errNotUpstream    = encodeError("not_an_upstream", "the proxy only serves the origins of configured upstreams")
 	errProxyTLSOff    = encodeError("proxy_https_unavailable", "https proxying needs proxy.ca_cert_file and proxy.ca_key_file on the gateway")
 	errProxyBadTarget = encodeError("bad_target", "the proxy target is not a valid host:port")
+	errProxyDisabled  = encodeError("proxy_disabled", "proxy mode is not enabled on this gateway")
+	errProxyBusy      = encodeError("proxy_busy", "the gateway's intercepted tunnel limit is reached; retry later")
 )
+
+const maxProxyTunnels = 256
 
 func originKey(scheme, host string) string {
 	host = strings.ToLower(host)
@@ -95,11 +99,21 @@ func proxyKey(r *http.Request) string {
 // that authenticated the CONNECT tunnel; otherwise the key comes from
 // Proxy-Authorization or the usual request headers.
 func (g *Gateway) serveProxied(rs *reqState, r *http.Request, scheme, host string, tunnelKey *runtimeKey) {
+	if g.closed.Load() {
+		rs.info.outcome = "shutting_down"
+		writeStaticError(&rs.rec, http.StatusServiceUnavailable, errShuttingDown)
+		return
+	}
 	st := g.state.Load()
 	if st.cfg.Proxy == nil {
-		// Proxy mode is off: treat absolute-form targets like any request.
-		rs.ev.Proxy = false
-		g.serve(rs, r, r.URL.EscapedPath())
+		rs.info.outcome = "proxy_disabled"
+		writeStaticError(&rs.rec, http.StatusMethodNotAllowed, errProxyDisabled)
+		return
+	}
+	if r.URL.User != nil || r.URL.Opaque != "" || r.URL.Fragment != "" ||
+		(scheme != "http" && scheme != "https") {
+		rs.info.outcome = "bad_path"
+		writeStaticError(&rs.rec, http.StatusBadRequest, errProxyBadTarget)
 		return
 	}
 	rs.info.proxied = true
@@ -173,7 +187,7 @@ func (g *Gateway) serveConnect(w http.ResponseWriter, r *http.Request) {
 	defer record()
 	if st.cfg.Proxy == nil {
 		rs.info.outcome = "bad_path"
-		writeStaticError(&rs.rec, http.StatusMethodNotAllowed, encodeError("proxy_disabled", "proxy mode is not enabled on this gateway"))
+		writeStaticError(&rs.rec, http.StatusMethodNotAllowed, errProxyDisabled)
 		return
 	}
 	host, _, err := net.SplitHostPort(r.Host)
@@ -184,12 +198,22 @@ func (g *Gateway) serveConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	// Tunnels are only opened for a valid key (default deny); every request
 	// inside is checked again against the then-active configuration.
-	k := g.authenticate(rs, st, proxyKey(r), true)
+	tunnelKeyValue := proxyKey(r)
+	k := g.authenticate(rs, st, tunnelKeyValue, true)
 	if k == nil {
 		return
 	}
 	routes := st.origins[originKey("https", r.Host)]
-	if len(routes) == 0 {
+	granted := false
+	for _, rt := range routes {
+		for _, grant := range k.grants {
+			if grant.upstream == rt.up.Name {
+				granted = true
+				break
+			}
+		}
+	}
+	if len(routes) == 0 || !granted {
 		rs.info.outcome = "forbidden"
 		writeStaticError(&rs.rec, http.StatusForbidden, errNotUpstream)
 		return
@@ -200,6 +224,15 @@ func (g *Gateway) serveConnect(w http.ResponseWriter, r *http.Request) {
 		writeStaticError(&rs.rec, http.StatusServiceUnavailable, errProxyTLSOff)
 		return
 	}
+	g.connMu.Lock()
+	full := len(g.tunnels) >= maxProxyTunnels
+	g.connMu.Unlock()
+	if full {
+		rs.info.outcome = "proxy_busy"
+		rs.rec.Header().Set("Retry-After", "1")
+		writeStaticError(&rs.rec, http.StatusServiceUnavailable, errProxyBusy)
+		return
+	}
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		rs.info.outcome = "upstream_error"
@@ -208,8 +241,36 @@ func (g *Gateway) serveConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	conn, brw, err := hj.Hijack()
 	if err != nil {
+		rs.rec.status = http.StatusInternalServerError
+		rs.info.outcome = "upstream_error"
 		return
 	}
+	g.connMu.Lock()
+	if g.closed.Load() || len(g.tunnels) >= maxProxyTunnels {
+		body, outcome := errProxyBusy, "proxy_busy"
+		if g.closed.Load() {
+			body, outcome = errShuttingDown, "shutting_down"
+		}
+		g.connMu.Unlock()
+		_, _ = fmt.Fprintf(brw, "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nRetry-After: 1\r\nContent-Length: %d\r\n\r\n", len(body))
+		_, _ = brw.Write(body)
+		_ = brw.Flush()
+		_ = conn.Close()
+		rs.rec.status = http.StatusServiceUnavailable
+		rs.info.outcome = outcome
+		return
+	}
+	if g.tunnels == nil {
+		g.tunnels = make(map[net.Conn]*http.Server)
+	}
+	g.tunnels[conn] = nil
+	g.connMu.Unlock()
+	defer func() {
+		_ = conn.Close()
+		g.connMu.Lock()
+		delete(g.tunnels, conn)
+		g.connMu.Unlock()
+	}()
 	rs.info.outcome = "tunnel"
 	rs.rec.status = http.StatusOK
 	record()
@@ -225,7 +286,10 @@ func (g *Gateway) serveConnect(w http.ResponseWriter, r *http.Request) {
 	tlsConn := tls.Server(c, &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		NextProtos: []string{"http/1.1"},
-		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if hello.ServerName != "" && !strings.EqualFold(hello.ServerName, host) {
+				return nil, errors.New("TLS server name differs from CONNECT target")
+			}
 			ca := g.state.Load().ca
 			if ca == nil {
 				return nil, errors.New("proxy CA removed")
@@ -236,6 +300,15 @@ func (g *Gateway) serveConnect(w http.ResponseWriter, r *http.Request) {
 	inner := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, ir *http.Request) {
 			rs := &reqState{rec: statusRecorder{ResponseWriter: w, status: http.StatusOK}, start: g.now()}
+			rs.info.presentedKey = tunnelKeyValue
+			if ir.Host != "" && originKey("https", ir.Host) != originKey("https", authority) ||
+				ir.URL.IsAbs() && (ir.URL.Scheme != "https" || originKey("https", ir.URL.Host) != originKey("https", authority)) {
+				rs.ev = Event{Method: ir.Method, Proxy: true}
+				rs.info.outcome = "bad_path"
+				writeStaticError(&rs.rec, http.StatusBadRequest, errProxyBadTarget)
+				g.finish(ir, rs)
+				return
+			}
 			ir.URL.Scheme, ir.URL.Host, ir.Host = "https", authority, authority
 			rs.ev = Event{Method: ir.Method, Path: ir.URL.EscapedPath(), Proxy: true}
 			defer g.finish(ir, rs)
@@ -251,12 +324,32 @@ func (g *Gateway) serveConnect(w http.ResponseWriter, r *http.Request) {
 		MaxHeaderBytes:    64 << 10,
 	}
 	l := newOneConnListener(tlsConn)
+	connectionDone := make(chan struct{})
+	var doneOnce sync.Once
 	inner.ConnState = func(_ net.Conn, s http.ConnState) {
 		if s == http.StateClosed || s == http.StateHijacked {
 			l.Close()
+			doneOnce.Do(func() { close(connectionDone) })
 		}
 	}
+	g.connMu.Lock()
+	if g.closed.Load() {
+		g.connMu.Unlock()
+		_ = conn.Close()
+		return
+	}
+	g.tunnels[conn] = inner
+	g.connMu.Unlock()
 	_ = inner.Serve(l)
+	// Serve returns as soon as Shutdown closes the listener, while an active
+	// HTTP request may still be running. Keep the hijacked connection alive
+	// until that request drains or Close forcibly interrupts it.
+	l.mu.Lock()
+	accepted := l.conn == nil
+	l.mu.Unlock()
+	if accepted {
+		<-connectionDone
+	}
 }
 
 type bufferedConn struct {
@@ -327,6 +420,10 @@ func loadProxyCA(certFile, keyFile string) (*proxyCA, error) {
 	if !cert.IsCA || cert.KeyUsage&x509.KeyUsageCertSign == 0 {
 		return nil, errors.New("the proxy CA certificate is not a CA with certificate-signing usage")
 	}
+	now := time.Now()
+	if now.Before(cert.NotBefore) || !now.Before(cert.NotAfter) {
+		return nil, errors.New("the proxy CA certificate is not currently valid")
+	}
 	signer, ok := pair.PrivateKey.(crypto.Signer)
 	if !ok {
 		return nil, errors.New("unsupported CA key type")
@@ -382,6 +479,9 @@ func (ca *proxyCA) leaf(host string, now time.Time) (*tls.Certificate, error) {
 // GenerateProxyCA writes a new ECDSA P-256 CA certificate and key for proxy
 // mode. The key file is created 0600 and never overwritten.
 func GenerateProxyCA(certFile, keyFile string, validity time.Duration) error {
+	if validity <= 0 {
+		return errors.New("proxy CA validity must be positive")
+	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return err
@@ -433,5 +533,10 @@ func GenerateProxyCA(certFile, keyFile string, validity time.Duration) error {
 		os.Remove(keyFile)
 		return err
 	}
-	return cf.Close()
+	if err := cf.Close(); err != nil {
+		os.Remove(certFile)
+		os.Remove(keyFile)
+		return err
+	}
+	return nil
 }

@@ -9,7 +9,7 @@ Hootway is a security boundary between agent sandboxes and real API credentials.
 
 ## Layout
 
-- `cmd/hootway` — CLI (`serve`, `check`, `key new`, `key hash`, `admin token`, `version`); exit 0/1/2, graceful SIGINT/SIGTERM drain.
+- `cmd/hootway` — CLI (`serve`, `check`, `key new`, `key hash`, `admin token`, `version`); exit 0/1/2, graceful SIGINT/SIGTERM drain including intercepted HTTPS requests.
 - `internal/gateway/config.go` — strict JSON schema and validation.
 - `internal/gateway/match.go` — route splitting, unsafe-path rejection, grant matching.
 - `internal/gateway/secrets.go` — credential resolution/injection and protected headers.
@@ -38,6 +38,7 @@ Hootway is a security boundary between agent sandboxes and real API credentials.
 
 ```sh
 gofmt -l . && go vet ./... && go test -race -cover ./...
+node --test scripts/console.test.mjs
 go build -o /tmp/hootway ./cmd/hootway
 key_hash=$(printf 'hw_ci' | /tmp/hootway key hash)
 sed "s/replace-with-output-of-hootway-key-new-000000000000000000000000/$key_hash/" examples/jira.json > /tmp/ci.json

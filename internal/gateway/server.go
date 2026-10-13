@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -9,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -42,6 +45,10 @@ type Gateway struct {
 
 	trMu       sync.Mutex
 	transports map[transportKey]*http.Transport // shared across reloads
+	applyMu    sync.Mutex                       // serialises configuration replacement and pool retirement
+	connMu     sync.Mutex
+	tunnels    map[net.Conn]*http.Server
+	closed     atomic.Bool
 }
 
 // transportKey identifies a shared transport: response header timeout and
@@ -73,13 +80,14 @@ type runtimeKey struct {
 }
 
 type route struct {
-	up       Upstream
-	basePath string
-	escBase  string // escaped base path, for matching proxy request paths
-	cred     credential
-	egress   egress
-	err      error
-	proxy    *httputil.ReverseProxy
+	up        Upstream
+	basePath  string
+	escBase   string // escaped base path, for matching proxy request paths
+	cred      credential
+	egress    egress
+	err       error
+	proxy     *httputil.ReverseProxy
+	sensitive []string // resolved credentials and their URL encodings; memory only
 }
 
 type window struct {
@@ -158,9 +166,83 @@ func New(cfg *Config, opts Options) (*Gateway, error) {
 // Apply atomically replaces the active configuration and returns credential
 // problems, keyed by upstream name.
 func (g *Gateway) Apply(cfg *Config) map[string]string {
+	g.applyMu.Lock()
+	defer g.applyMu.Unlock()
 	st := g.build(cfg)
 	g.state.Store(st)
+	g.retireTransports(st)
 	return st.problems
+}
+
+// Close closes intercepted CONNECT connections and idle outbound connections.
+// http.Server.Shutdown alone cannot close connections that were hijacked.
+// It is safe to call more than once; new requests are refused after Close.
+func (g *Gateway) Close() {
+	g.closed.Store(true)
+	g.connMu.Lock()
+	for conn := range g.tunnels {
+		_ = conn.Close()
+	}
+	g.connMu.Unlock()
+	g.trMu.Lock()
+	for _, tr := range g.transports {
+		tr.CloseIdleConnections()
+	}
+	g.trMu.Unlock()
+}
+
+// Shutdown seals admission and drains the HTTP servers inside intercepted
+// tunnels. These servers are not covered by the outer listener's Shutdown.
+func (g *Gateway) Shutdown(ctx context.Context) error {
+	g.closed.Store(true)
+	g.connMu.Lock()
+	servers := make([]*http.Server, 0, len(g.tunnels))
+	for conn, srv := range g.tunnels {
+		if srv == nil {
+			_ = conn.Close() // CONNECT/TLS setup has no active HTTP request
+		} else {
+			servers = append(servers, srv)
+		}
+	}
+	g.connMu.Unlock()
+	var wg sync.WaitGroup
+	errs := make(chan error, len(servers))
+	for _, srv := range servers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := srv.Shutdown(ctx); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	var problems []error
+	for err := range errs {
+		problems = append(problems, err)
+	}
+	if len(problems) > 0 {
+		g.Close()
+	}
+	return errors.Join(problems...)
+}
+
+func (g *Gateway) retireTransports(st *runtimeState) {
+	live := make(map[*http.Transport]bool, len(st.upstreams))
+	for _, rt := range st.upstreams {
+		if tr, ok := rt.proxy.Transport.(*http.Transport); ok {
+			live[tr] = true
+		}
+	}
+	g.trMu.Lock()
+	defer g.trMu.Unlock()
+	for key, tr := range g.transports {
+		if !live[tr] {
+			tr.CloseIdleConnections()
+			delete(g.transports, key)
+		}
+	}
 }
 
 // Config returns the active configuration. Callers must not modify it.
@@ -186,6 +268,15 @@ func (g *Gateway) build(cfg *Config) *runtimeState {
 		var credErr, egErr error
 		r.cred, credErr = resolveCredential(up.Auth, g.getenv)
 		r.egress, egErr = resolveEgress(up.OutboundProxy, cfg.OutboundProxy, g.getenv)
+		r.egress = r.egress.withSensitiveCredentials(up.base)
+		for _, secret := range []string{r.cred.value, r.cred.secret, r.egress.secret, r.egress.authorization} {
+			if secret != "" {
+				r.sensitive = append(r.sensitive, secret, url.QueryEscape(secret), url.PathEscape(secret))
+				if strings.HasPrefix(secret, "Basic ") {
+					r.sensitive = append(r.sensitive, strings.TrimPrefix(secret, "Basic "))
+				}
+			}
+		}
 		if r.err = errors.Join(credErr, egErr); r.err != nil {
 			st.problems[up.Name] = r.err.Error()
 		}
@@ -203,9 +294,12 @@ func (g *Gateway) build(cfg *Config) *runtimeState {
 			Transport:      transport,
 			BufferPool:     proxyBuffers,
 			ModifyResponse: r.modifyResponse,
+			// ReverseProxy's body-copy errors can contain upstream-controlled
+			// messages. The gateway records a safe outcome itself.
+			ErrorLog: log.New(io.Discard, "", 0),
 			ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
 				g.log.LogAttrs(req.Context(), slog.LevelWarn, "upstream error",
-					slog.String("upstream", name), slog.String("error", err.Error()))
+					slog.String("upstream", name), slog.String("error_type", fmt.Sprintf("%T", err)))
 				infoFrom(req.Context()).outcome = "upstream_error"
 				writeError(w, http.StatusBadGateway, "upstream_unreachable", "the upstream request failed")
 			},
@@ -305,12 +399,18 @@ func generate(prefix string) (key, hash string, err error) {
 type ctxKey struct{}
 
 type requestInfo struct {
-	rest    string
-	outcome string
-	proxied bool // forward-proxy request: keep absolute redirects as they are
+	rest         string
+	outcome      string
+	proxied      bool   // forward-proxy request: keep absolute redirects as they are
+	presentedKey string // request-scoped, used only to redact the audit path
+	route        *route
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if g.closed.Load() {
+		writeStaticError(w, http.StatusServiceUnavailable, errShuttingDown)
+		return
+	}
 	if r.URL.Path == "/healthz" && !r.URL.IsAbs() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
@@ -346,6 +446,24 @@ type reqState struct {
 
 func (g *Gateway) finish(r *http.Request, rs *reqState) {
 	ev := &rs.ev
+	rt := rs.info.route
+	if rt == nil {
+		// Authentication failures still need redaction for a known route.
+		st := g.state.Load()
+		var name string
+		if r.URL.IsAbs() {
+			name, _, _ = st.matchOrigin(r.URL.Scheme, r.URL.Host, orRoot(r.URL.EscapedPath()))
+		} else {
+			name, _, _ = splitRoute(r.URL.EscapedPath())
+		}
+		rt = st.upstreams[name]
+	}
+	for _, field := range []*string{&ev.Path, &ev.Method} {
+		if rs.info.presentedKey != "" && containsSensitiveValue(*field, []string{rs.info.presentedKey}) ||
+			rt != nil && rt.containsSecret(*field) {
+			*field = "[redacted]"
+		}
+	}
 	ev.Time = rs.start
 	ev.Status = rs.rec.status
 	ev.Outcome = rs.info.outcome
@@ -383,6 +501,7 @@ func (g *Gateway) validKey(st *runtimeState, presented string) (k *runtimeKey, o
 // authenticate checks the presented key and writes the rejection itself.
 // Proxy requests are challenged with 407 so clients send proxy credentials.
 func (g *Gateway) authenticate(rs *reqState, st *runtimeState, presented string, proxy bool) *runtimeKey {
+	rs.info.presentedKey = presented
 	rec, info := &rs.rec, &rs.info
 	status, challenge := http.StatusUnauthorized, "WWW-Authenticate"
 	if proxy {
@@ -423,6 +542,7 @@ func (g *Gateway) forward(rs *reqState, r *http.Request, st *runtimeState, k *ru
 	rec, info, ev := &rs.rec, &rs.info, &rs.ev
 	ev.Upstream = name
 	rt := st.upstreams[name]
+	info.route = rt
 	if rt == nil || !k.allows(name, r.Method, rest) {
 		info.outcome = "forbidden"
 		writeStaticError(rec, http.StatusForbidden, errForbidden)
@@ -441,6 +561,7 @@ func (g *Gateway) forward(rs *reqState, r *http.Request, st *runtimeState, k *ru
 	}
 	info.outcome = "forwarded"
 	info.rest = rest
+	rec.sanitize = rt.sanitizeResponseHeaders
 	rt.proxy.ServeHTTP(rec, r.WithContext(contextWith(r.Context(), info)))
 }
 
@@ -474,8 +595,18 @@ func (g *Gateway) Explain(keyID, method, path string) Decision {
 		return Decision{Outcome: "invalid_key", Reason: "the key has expired"}
 	}
 	var name, rest string
-	if u, err := url.Parse(path); err == nil && u.IsAbs() {
+	u, err := url.Parse(path)
+	if err != nil || u.Fragment != "" || strings.Contains(path, "#") || u.User != nil || u.Opaque != "" || u.Host != "" && !u.IsAbs() {
+		return Decision{Outcome: "bad_path", Reason: "provide a path or http(s) URL without userinfo or a fragment"}
+	}
+	if u.IsAbs() {
 		// A real upstream URL, as an agent would request it through proxy mode.
+		if st.cfg.Proxy == nil {
+			return Decision{Outcome: "proxy_disabled", Reason: "real upstream URLs require proxy mode; use /<upstream>/<path> on the gateway"}
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return Decision{Outcome: "bad_path", Reason: "the proxy target must be an http(s) URL"}
+		}
 		var ok bool
 		name, rest, ok = st.matchOrigin(u.Scheme, u.Host, u.EscapedPath())
 		switch {
@@ -485,10 +616,7 @@ func (g *Gateway) Explain(keyID, method, path string) Decision {
 			return Decision{Outcome: "forbidden", Reason: "no upstream has this origin and base path"}
 		}
 	} else {
-		if err == nil && u.RawQuery != "" {
-			path = u.EscapedPath()
-		}
-		name, rest, err = splitRoute(path)
+		name, rest, err = splitRoute(u.EscapedPath())
 		if err != nil {
 			return Decision{Outcome: "bad_path", Reason: "the path contains dot segments, // or encoded separators"}
 		}
@@ -567,7 +695,7 @@ func (rt *route) rewrite(pr *httputil.ProxyRequest) {
 	base := rt.up.base
 	out.URL.Scheme = base.Scheme
 	out.URL.Host = base.Host
-	out.URL.RawPath = rt.basePath + info.rest
+	out.URL.RawPath = rt.escBase + info.rest
 	if p, err := url.PathUnescape(out.URL.RawPath); err == nil {
 		out.URL.Path = p
 	}
@@ -582,6 +710,10 @@ func (rt *route) rewrite(pr *httputil.ProxyRequest) {
 	delete(out.Header, "X-Forwarded-For")
 	delete(out.Header, "X-Forwarded-Host")
 	delete(out.Header, "X-Forwarded-Proto")
+	// Trailer values arrive only after the request body is read. Dropping
+	// their map prevents late credentials or policy overrides bypassing the
+	// header sanitiser.
+	out.Trailer = nil
 	for k, v := range rt.up.Headers {
 		out.Header.Set(k, v)
 	}
@@ -605,15 +737,144 @@ func (rt *route) modifyResponse(resp *http.Response) error {
 	// redirects through the proxy themselves.
 	if loc := resp.Header.Get("Location"); loc != "" && !infoFrom(resp.Request.Context()).proxied {
 		if u, err := url.Parse(loc); err == nil && u.IsAbs() && u.Host == rt.up.base.Host && u.Scheme == rt.up.base.Scheme &&
-			strings.HasPrefix(u.EscapedPath(), rt.up.base.Path+"/") {
-			rel := "/" + rt.up.Name + strings.TrimPrefix(u.EscapedPath(), rt.up.base.Path)
+			(u.EscapedPath() == rt.escBase || strings.HasPrefix(u.EscapedPath(), rt.escBase+"/")) {
+			rel := "/" + rt.up.Name + orRoot(strings.TrimPrefix(u.EscapedPath(), rt.escBase))
 			if u.RawQuery != "" {
 				rel += "?" + u.RawQuery
 			}
 			resp.Header.Set("Location", rel)
 		}
 	}
+	rt.sanitizeResponseHeaders(resp.Header)
+	rt.sanitizeResponseHeaders(resp.Trailer)
+	if resp.Body != nil && resp.Body != http.NoBody {
+		// Unannounced trailers can allocate/replace resp.Trailer at EOF.
+		// Keep the response, not its initial map, so those are filtered too.
+		resp.Body = &sanitisedResponseBody{ReadCloser: resp.Body, route: rt, response: resp}
+	}
 	return nil
+}
+
+// Sanitise every response header channel, including informational responses
+// and trailers. Body contents remain the upstream API's responsibility.
+func (rt *route) sanitizeResponseHeaders(h http.Header) {
+	for name, values := range h {
+		plain := strings.TrimPrefix(name, http.TrailerPrefix)
+		switch http.CanonicalHeaderKey(plain) {
+		case "Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie":
+			delete(h, name)
+			continue
+		}
+		if strings.HasPrefix(http.CanonicalHeaderKey(plain), "X-Hootway-") ||
+			(rt.cred.auth.Type == "header" && strings.EqualFold(plain, rt.cred.auth.Name)) {
+			delete(h, name)
+			continue
+		}
+		for _, value := range values {
+			if rt.containsSecret(value) {
+				delete(h, name)
+				break
+			}
+		}
+	}
+}
+
+func (rt *route) containsSecret(v string) bool {
+	return containsSensitiveValue(v, rt.sensitive)
+}
+
+func containsSensitiveValue(v string, secrets []string) bool {
+	if len(secrets) == 0 {
+		return false
+	}
+	// Compare decoded URL spellings too: percent escapes are case insensitive
+	// and an upstream may echo a credential with more than one encoded layer.
+	for depth := 0; depth < 4; depth++ {
+		for _, secret := range secrets {
+			if strings.Contains(v, secret) {
+				return true
+			}
+		}
+		if !strings.ContainsAny(v, "%+") {
+			return false
+		}
+		query := unescapeSensitiveValue(v, true)
+		for _, secret := range secrets {
+			if strings.Contains(query, secret) {
+				return true
+			}
+		}
+		decoded := unescapeSensitiveValue(v, false)
+		if decoded == v {
+			return false
+		}
+		v = decoded
+	}
+	return false
+}
+
+// A malformed escape elsewhere in a header must not hide a valid encoded
+// credential. Decode valid escapes while keeping malformed ones literal.
+func unescapeSensitiveValue(v string, query bool) string {
+	var decoded string
+	var err error
+	if query {
+		decoded, err = url.QueryUnescape(v)
+	} else {
+		decoded, err = url.PathUnescape(v)
+	}
+	if err == nil {
+		return decoded
+	}
+	buf := make([]byte, 0, len(v))
+	for i := 0; i < len(v); i++ {
+		if v[i] == '%' && i+2 < len(v) {
+			hi, hiOK := sensitiveHexDigit(v[i+1])
+			lo, loOK := sensitiveHexDigit(v[i+2])
+			if hiOK && loOK {
+				buf = append(buf, hi<<4|lo)
+				i += 2
+				continue
+			}
+		}
+		if query && v[i] == '+' {
+			buf = append(buf, ' ')
+		} else {
+			buf = append(buf, v[i])
+		}
+	}
+	return string(buf)
+}
+
+func sensitiveHexDigit(b byte) (byte, bool) {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0', true
+	case b|0x20 >= 'a' && b|0x20 <= 'f':
+		return (b | 0x20) - 'a' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+type sanitisedResponseBody struct {
+	io.ReadCloser
+	route    *route
+	response *http.Response
+}
+
+func (b *sanitisedResponseBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == io.EOF {
+		b.route.sanitizeResponseHeaders(b.response.Trailer)
+	}
+	return n, err
+}
+
+func (b *sanitisedResponseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.route.sanitizeResponseHeaders(b.response.Trailer)
+	return err
 }
 
 // stripQueryParam removes name from the query of the URL reference v. An
@@ -656,6 +917,7 @@ var (
 	errForbidden    = encodeError("forbidden", "this key is not allowed to call this upstream method and path")
 	errRateLimited  = encodeError("rate_limited", "the key's request rate limit is exhausted")
 	errUnconfigured = encodeError("upstream_unconfigured", "the gateway has no usable credential for this upstream")
+	errShuttingDown = encodeError("shutting_down", "the gateway is shutting down")
 )
 
 func writeStaticError(w http.ResponseWriter, status int, body []byte) {
@@ -672,11 +934,17 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 
 type statusRecorder struct {
 	http.ResponseWriter
-	status int
+	status   int
+	sanitize func(http.Header)
 }
 
 func (s *statusRecorder) WriteHeader(code int) {
-	s.status = code
+	if s.sanitize != nil {
+		s.sanitize(s.Header())
+	}
+	if code >= 200 {
+		s.status = code
+	}
 	s.ResponseWriter.WriteHeader(code)
 }
 

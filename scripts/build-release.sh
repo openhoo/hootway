@@ -5,6 +5,7 @@ version="${VERSION:?VERSION is required (semantic, without v)}"
 commit="${COMMIT:-$(git rev-parse HEAD)}"
 source_date_epoch="${SOURCE_DATE_EPOCH:-$(git show -s --format=%ct HEAD)}"
 dist_dir="${DIST_DIR:-$(pwd)/dist}"
+[[ "$dist_dir" == /* ]] || dist_dir="$(pwd)/$dist_dir"
 
 if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
   echo "VERSION must be semantic without a v prefix" >&2
@@ -16,6 +17,10 @@ if ! tar --version 2>/dev/null | grep -q 'GNU tar'; then
 fi
 if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
   echo "release builds require a clean worktree" >&2
+  exit 2
+fi
+if [[ -d "$dist_dir" ]] && [[ -n "$(find "$dist_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+  echo "release output directory must be empty; choose a new DIST_DIR" >&2
   exit 2
 fi
 

@@ -76,6 +76,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	case "serve", "check":
 		return serveOrCheck(args[0], args[1:], stdout, stderr)
 	case "key":
+		if len(args) != 2 {
+			return usageError{"usage: hootway key new|hash"}
+		}
 		sub := ""
 		if len(args) > 1 {
 			sub = args[1]
@@ -90,9 +93,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 			fmt.Fprintln(stderr, "Give the key to the agent; store only the sha256 in hootway.json.")
 			return nil
 		case "hash":
-			data, err := io.ReadAll(io.LimitReader(stdin, 4096))
+			data, err := io.ReadAll(io.LimitReader(stdin, 4097))
 			if err != nil {
 				return err
+			}
+			if len(data) > 4096 {
+				return usageError{"key on stdin exceeds 4096 bytes"}
 			}
 			key := strings.TrimRight(string(data), "\r\n")
 			if key == "" {
@@ -103,7 +109,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		}
 		return usageError{"usage: hootway key new|hash"}
 	case "admin":
-		if len(args) < 2 || args[1] != "token" {
+		if len(args) != 2 || args[1] != "token" {
 			return usageError{"usage: hootway admin token"}
 		}
 		token, hash, err := gateway.GenerateAdminToken()
@@ -119,9 +125,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		}
 		return proxyCA(args[2:], stdout, stderr)
 	case "version", "-v", "--version":
+		if len(args) != 1 {
+			return usageError{"usage: hootway version"}
+		}
 		fmt.Fprintf(stdout, "hootway %s (%s)\n", version, commit)
 		return nil
 	case "help", "-h", "-help", "--help":
+		if len(args) != 1 {
+			return usageError{"usage: hootway help"}
+		}
 		fmt.Fprint(stdout, usage)
 		return nil
 	}
@@ -142,7 +154,7 @@ func serveOrCheck(cmd string, args []string, stdout, stderr io.Writer) error {
 		return usageError{err.Error()}
 	}
 	if fs.NArg() > 0 {
-		return usageError{fmt.Sprintf("unexpected argument %q", fs.Arg(0))}
+		return usageError{"unexpected positional argument"}
 	}
 	cfg, err := gateway.LoadConfig(*path)
 	if err != nil {
@@ -163,6 +175,7 @@ func serveOrCheck(cmd string, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	defer gw.Close()
 	if cmd == "check" {
 		fmt.Fprintf(stdout, "configuration ok: %d upstreams, %d keys\n", len(cfg.Upstreams), len(cfg.Keys))
 		return nil
@@ -238,12 +251,28 @@ func serve(ctx context.Context, servers []*http.Server, logger *slog.Logger) err
 		case <-shutdown.Done():
 		}
 	}()
+	// Hijacked proxy connections are outside http.Server's drain. Seal and
+	// drain the gateway's inner HTTPS servers alongside the outer listeners,
+	// sharing the same deadline and second-signal cancellation.
+	drained := make(chan error, 2*len(servers))
+	count := 0
 	for _, srv := range servers {
-		if err := srv.Shutdown(shutdown); err != nil {
-			srv.Close()
-			if runErr == nil {
-				runErr = fmt.Errorf("shutdown: %w", err)
+		count++
+		go func() {
+			err := srv.Shutdown(shutdown)
+			if err != nil {
+				srv.Close()
 			}
+			drained <- err
+		}()
+		if h, ok := srv.Handler.(interface{ Shutdown(context.Context) error }); ok {
+			count++
+			go func() { drained <- h.Shutdown(shutdown) }()
+		}
+	}
+	for i := 0; i < count; i++ {
+		if err := <-drained; err != nil && runErr == nil {
+			runErr = fmt.Errorf("shutdown: %w", err)
 		}
 	}
 	if errors.Is(runErr, http.ErrServerClosed) {
@@ -271,8 +300,11 @@ func proxyCA(args []string, stdout, stderr io.Writer) error {
 		}
 		return usageError{err.Error()}
 	}
-	if fs.NArg() > 0 || *days < 1 {
-		return usageError{"usage: hootway proxy ca [-cert FILE] [-key FILE] [-days N]"}
+	// Bound before converting to a nanosecond duration so large values cannot
+	// wrap and create an already-expired certificate.
+	const maxCADays = int((1<<63 - 1) / (24 * time.Hour))
+	if fs.NArg() > 0 || *days < 1 || *days > maxCADays {
+		return usageError{fmt.Sprintf("usage: hootway proxy ca [-cert FILE] [-key FILE] [-days N] (days: 1-%d)", maxCADays)}
 	}
 	if err := gateway.GenerateProxyCA(*cert, *key, time.Duration(*days)*24*time.Hour); err != nil {
 		return err
