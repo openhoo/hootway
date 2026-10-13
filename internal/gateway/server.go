@@ -63,6 +63,10 @@ type runtimeState struct {
 	upstreams map[string]*route
 	keys      map[[sha256.Size]byte]*runtimeKey // by SHA-256 of the virtual key
 	problems  map[string]string
+	// auditSensitive combines known credentials for rejected or unknown routes.
+	// Deduplication keeps shared credentials and URL decoding out of repeated
+	// per-route scans when recording a rejected request.
+	auditSensitive []string
 	// origins indexes routes by scheme://host:port for proxy requests,
 	// longest base path first.
 	origins map[string][]*route
@@ -254,6 +258,7 @@ func (g *Gateway) Problems() map[string]string { return g.state.Load().problems 
 func (g *Gateway) build(cfg *Config) *runtimeState {
 	st := &runtimeState{cfg: cfg, upstreams: map[string]*route{}, keys: make(map[[sha256.Size]byte]*runtimeKey, len(cfg.Keys)),
 		problems: map[string]string{}, origins: map[string][]*route{}}
+	auditSeen := make(map[string]bool)
 	if cfg.Proxy != nil && cfg.Proxy.CACertFile != "" {
 		st.ca, st.caErr = loadProxyCA(cfg.Proxy.CACertFile, cfg.Proxy.CAKeyFile)
 	}
@@ -275,6 +280,12 @@ func (g *Gateway) build(cfg *Config) *runtimeState {
 				if strings.HasPrefix(secret, "Basic ") {
 					r.sensitive = append(r.sensitive, strings.TrimPrefix(secret, "Basic "))
 				}
+			}
+		}
+		for _, value := range r.sensitive {
+			if !auditSeen[value] {
+				auditSeen[value] = true
+				st.auditSensitive = append(st.auditSensitive, value)
 			}
 		}
 		if r.err = errors.Join(credErr, egErr); r.err != nil {
@@ -442,25 +453,23 @@ type reqState struct {
 	info  requestInfo
 	ev    Event
 	start time.Time
+	state *runtimeState // credential snapshot used when recording rejected requests
 }
 
 func (g *Gateway) finish(r *http.Request, rs *reqState) {
 	ev := &rs.ev
 	rt := rs.info.route
-	if rt == nil {
-		// Authentication failures still need redaction for a known route.
-		st := g.state.Load()
-		var name string
-		if r.URL.IsAbs() {
-			name, _, _ = st.matchOrigin(r.URL.Scheme, r.URL.Host, orRoot(r.URL.EscapedPath()))
-		} else {
-			name, _, _ = splitRoute(r.URL.EscapedPath())
-		}
-		rt = st.upstreams[name]
-	}
 	for _, field := range []*string{&ev.Path, &ev.Method} {
-		if rs.info.presentedKey != "" && containsSensitiveValue(*field, []string{rs.info.presentedKey}) ||
-			rt != nil && rt.containsSecret(*field) {
+		secret := rs.info.presentedKey != "" && containsSensitiveValue(*field, []string{rs.info.presentedKey})
+		if rs.state != nil {
+			// A request can echo a different upstream's credential, and an
+			// ambiguous path may not identify any route. Check the original
+			// snapshot once so neither routing nor reloads weaken redaction.
+			secret = secret || containsSensitiveValue(*field, rs.state.auditSensitive)
+		} else if rt != nil {
+			secret = secret || rt.containsSecret(*field)
+		}
+		if secret {
 			*field = "[redacted]"
 		}
 	}
@@ -479,6 +488,7 @@ func (g *Gateway) finish(r *http.Request, rs *reqState) {
 
 func (g *Gateway) serve(rs *reqState, r *http.Request, path string) {
 	st := g.state.Load()
+	rs.state = st
 	k := g.authenticate(rs, st, extractKey(r), false)
 	if k == nil {
 		return
@@ -487,6 +497,11 @@ func (g *Gateway) serve(rs *reqState, r *http.Request, path string) {
 	if err != nil {
 		rs.info.outcome = "bad_path"
 		writeStaticError(&rs.rec, http.StatusBadRequest, errBadPath)
+		return
+	}
+	if checkQuery(r.URL.RawQuery) != nil {
+		rs.info.outcome = "bad_query"
+		writeStaticError(&rs.rec, http.StatusBadRequest, errBadQuery)
 		return
 	}
 	g.forward(rs, r, st, k, name, rest)
@@ -612,6 +627,8 @@ func (g *Gateway) Explain(keyID, method, path string) Decision {
 		switch {
 		case checkPath(orRoot(u.EscapedPath())) != nil:
 			return Decision{Outcome: "bad_path", Reason: "the path contains dot segments, // or encoded separators"}
+		case checkQuery(u.RawQuery) != nil:
+			return Decision{Outcome: "bad_query", Reason: "the query contains a malformed percent escape or an unescaped semicolon"}
 		case !ok:
 			return Decision{Outcome: "forbidden", Reason: "no upstream has this origin and base path"}
 		}
@@ -619,6 +636,9 @@ func (g *Gateway) Explain(keyID, method, path string) Decision {
 		name, rest, err = splitRoute(u.EscapedPath())
 		if err != nil {
 			return Decision{Outcome: "bad_path", Reason: "the path contains dot segments, // or encoded separators"}
+		}
+		if checkQuery(u.RawQuery) != nil {
+			return Decision{Outcome: "bad_query", Reason: "the query contains a malformed percent escape or an unescaped semicolon"}
 		}
 	}
 	rt := st.upstreams[name]
@@ -633,7 +653,7 @@ func (g *Gateway) Explain(keyID, method, path string) Decision {
 			if rt.err != nil {
 				return Decision{Outcome: "upstream_unconfigured", Reason: "allowed, but the upstream credential is unavailable: " + rt.err.Error(), Grant: gr}
 			}
-			return Decision{Allowed: true, Outcome: "forwarded", Reason: fmt.Sprintf("allowed and forwarded to %s%s", rt.up.base.String(), rest), Grant: gr}
+			return Decision{Allowed: true, Outcome: "forwarded", Reason: fmt.Sprintf("would forward to %s%s", rt.up.base.String(), rest), Grant: gr}
 		}
 	}
 	return Decision{Outcome: "forbidden", Reason: fmt.Sprintf("no grant allows %s %s on %s", method, rest, name)}
@@ -722,27 +742,34 @@ func (rt *route) rewrite(pr *httputil.ProxyRequest) {
 
 func (rt *route) modifyResponse(resp *http.Response) error {
 	resp.Header.Del("Set-Cookie")
+	// Keep redirects inside the gateway so the agent never needs the
+	// upstream credential to follow them. Proxy clients follow absolute
+	// redirects through the proxy themselves.
+	if loc := resp.Header.Get("Location"); loc != "" && resp.Request != nil && !infoFrom(resp.Request.Context()).proxied {
+		if ref, err := url.Parse(loc); err == nil {
+			u := resp.Request.URL.ResolveReference(ref)
+			if u.User == nil && u.Opaque == "" && originKey(u.Scheme, u.Host) == originKey(rt.up.base.Scheme, rt.up.base.Host) &&
+				(u.EscapedPath() == rt.escBase || rt.escBase == "" || strings.HasPrefix(u.EscapedPath(), rt.escBase+"/")) {
+				rel := "/" + rt.up.Name + orRoot(strings.TrimPrefix(u.EscapedPath(), rt.escBase))
+				if u.RawQuery != "" || u.ForceQuery {
+					rel += "?" + u.RawQuery
+				}
+				if u.Fragment != "" {
+					rel += "#" + u.EscapedFragment()
+				}
+				resp.Header.Set("Location", rel)
+			}
+		}
+	}
 	if rt.cred.auth.Type == "query" {
-		// The injected query credential must never come back to the caller
-		// in a URL the upstream echoes.
+		// Strip after resolving references: fragment-only locations inherit
+		// the upstream request's injected credential, while a query-only
+		// location must keep its reference semantics until it is resolved.
 		resp.Header.Del("Refresh")
 		for _, h := range [...]string{"Location", "Content-Location"} {
 			if v := resp.Header.Get(h); v != "" {
 				resp.Header.Set(h, stripQueryParam(v, rt.cred.auth.Name))
 			}
-		}
-	}
-	// Keep redirects inside the gateway so the agent never needs the
-	// upstream credential to follow them. Proxy clients follow absolute
-	// redirects through the proxy themselves.
-	if loc := resp.Header.Get("Location"); loc != "" && !infoFrom(resp.Request.Context()).proxied {
-		if u, err := url.Parse(loc); err == nil && u.IsAbs() && u.Host == rt.up.base.Host && u.Scheme == rt.up.base.Scheme &&
-			(u.EscapedPath() == rt.escBase || strings.HasPrefix(u.EscapedPath(), rt.escBase+"/")) {
-			rel := "/" + rt.up.Name + orRoot(strings.TrimPrefix(u.EscapedPath(), rt.escBase))
-			if u.RawQuery != "" {
-				rel += "?" + u.RawQuery
-			}
-			resp.Header.Set("Location", rel)
 		}
 	}
 	rt.sanitizeResponseHeaders(resp.Header)
@@ -914,6 +941,7 @@ var (
 	errMissingKey   = encodeError("missing_key", "a Hootway virtual key is required")
 	errInvalidKey   = encodeError("invalid_key", "the virtual key is unknown, disabled or expired")
 	errBadPath      = encodeError("bad_path", "the request path contains disallowed encodings or dot segments")
+	errBadQuery     = encodeError("bad_query", "the query contains a malformed percent escape or an unescaped semicolon")
 	errForbidden    = encodeError("forbidden", "this key is not allowed to call this upstream method and path")
 	errRateLimited  = encodeError("rate_limited", "the key's request rate limit is exhausted")
 	errUnconfigured = encodeError("upstream_unconfigured", "the gateway has no usable credential for this upstream")

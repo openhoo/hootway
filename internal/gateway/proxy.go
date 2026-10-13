@@ -105,6 +105,7 @@ func (g *Gateway) serveProxied(rs *reqState, r *http.Request, scheme, host strin
 		return
 	}
 	st := g.state.Load()
+	rs.state = st
 	if st.cfg.Proxy == nil {
 		rs.info.outcome = "proxy_disabled"
 		writeStaticError(&rs.rec, http.StatusMethodNotAllowed, errProxyDisabled)
@@ -151,6 +152,11 @@ func (g *Gateway) serveProxied(rs *reqState, r *http.Request, scheme, host strin
 		writeStaticError(&rs.rec, http.StatusBadRequest, errBadPath)
 		return
 	}
+	if checkQuery(r.URL.RawQuery) != nil {
+		rs.info.outcome = "bad_query"
+		writeStaticError(&rs.rec, http.StatusBadRequest, errBadQuery)
+		return
+	}
 	name, rest, ok := st.matchOrigin(scheme, host, path)
 	if !ok {
 		rs.info.outcome = "forbidden"
@@ -176,6 +182,7 @@ func (g *Gateway) stillValid(st *runtimeState, k *runtimeKey) *runtimeKey {
 func (g *Gateway) serveConnect(w http.ResponseWriter, r *http.Request) {
 	st := g.state.Load()
 	rs := &reqState{rec: statusRecorder{ResponseWriter: w, status: http.StatusOK}, start: g.now()}
+	rs.state = st
 	rs.ev = Event{Method: r.Method, Path: r.Host, Proxy: true}
 	recorded := false
 	record := func() {
@@ -300,6 +307,7 @@ func (g *Gateway) serveConnect(w http.ResponseWriter, r *http.Request) {
 	inner := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, ir *http.Request) {
 			rs := &reqState{rec: statusRecorder{ResponseWriter: w, status: http.StatusOK}, start: g.now()}
+			rs.state = g.state.Load()
 			rs.info.presentedKey = tunnelKeyValue
 			if ir.Host != "" && originKey("https", ir.Host) != originKey("https", authority) ||
 				ir.URL.IsAbs() && (ir.URL.Scheme != "https" || originKey("https", ir.URL.Host) != originKey("https", authority)) {

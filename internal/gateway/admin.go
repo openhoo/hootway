@@ -25,6 +25,7 @@ import (
 var webFS embed.FS
 
 const sessionCookie = "hootway_admin"
+const maxAdminSessions = 256
 
 // Admin serves the web console and the admin API. It must run on a listener
 // that agent sandboxes cannot reach.
@@ -75,8 +76,8 @@ func (a *AdminServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // sync), which keeps the gzip encoder out of the binary. Clients without
 // gzip support get the body decompressed once at startup.
 type webAsset struct {
-	typ, etag string
-	raw, gz   []byte
+	typ, etag, gzETag string
+	raw, gz           []byte
 }
 
 var webAssets = loadWebAssets()
@@ -106,7 +107,9 @@ func loadWebAssets() map[string]*webAsset {
 			panic(err)
 		}
 		sum := sha256.Sum256(raw)
-		a := &webAsset{typ: types[filepath.Ext(name)], etag: `"` + hex.EncodeToString(sum[:8]) + `"`, raw: raw, gz: gz}
+		gzSum := sha256.Sum256(gz)
+		a := &webAsset{typ: types[filepath.Ext(name)], etag: `"` + hex.EncodeToString(sum[:8]) + `"`,
+			gzETag: `"` + hex.EncodeToString(gzSum[:8]) + `"`, raw: raw, gz: gz}
 		if a.typ == "" {
 			a.typ = "application/octet-stream"
 		}
@@ -119,19 +122,23 @@ func (a *webAsset) serve(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()
 	h.Set("Content-Type", a.typ)
 	h.Set("Cache-Control", "no-cache")
-	h.Set("ETag", a.etag)
 	h.Set("Vary", "Accept-Encoding")
-	for _, tag := range strings.Split(r.Header.Get("If-None-Match"), ",") {
+	body, etag := a.raw, a.etag
+	ae := strings.Join(r.Header.Values("Accept-Encoding"), ",")
+	if a.gz != nil && acceptsGzip(ae) {
+		h.Set("Content-Encoding", "gzip")
+		body, etag = a.gz, a.gzETag
+	} else if encodingQuality(ae, "identity", 1) <= 0 {
+		http.Error(w, "no acceptable content encoding", http.StatusNotAcceptable)
+		return
+	}
+	h.Set("ETag", etag)
+	for _, tag := range strings.Split(strings.Join(r.Header.Values("If-None-Match"), ","), ",") {
 		tag = strings.TrimSpace(tag)
-		if tag == "*" || strings.TrimPrefix(tag, "W/") == a.etag {
+		if tag == "*" || strings.TrimPrefix(tag, "W/") == etag {
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
-	}
-	body := a.raw
-	if a.gz != nil && acceptsGzip(r.Header.Get("Accept-Encoding")) {
-		h.Set("Content-Encoding", "gzip")
-		body = a.gz
 	}
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	if r.Method != http.MethodHead {
@@ -140,31 +147,64 @@ func (a *webAsset) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func acceptsGzip(ae string) bool {
-	wildcard := false
+	return encodingQuality(ae, "gzip", 0) > 0
+}
+
+// Repeated codings and parameters use their lowest quality, so a later value
+// cannot override an explicit refusal. Invalid qvalues are refused as well.
+func encodingQuality(ae, encoding string, fallback float64) float64 {
+	wildcard, explicit := -1.0, -1.0
 	for _, part := range strings.Split(ae, ",") {
 		fields := strings.Split(part, ";")
 		name := strings.TrimSpace(fields[0])
-		if !strings.EqualFold(name, "gzip") && name != "*" {
+		if !strings.EqualFold(name, encoding) && name != "*" {
 			continue
 		}
-		quality := 1.0
+		quality, hasQuality := 1.0, false
 		for _, field := range fields[1:] {
 			key, value, ok := strings.Cut(strings.TrimSpace(field), "=")
 			if !ok || !strings.EqualFold(strings.TrimSpace(key), "q") {
 				continue
 			}
-			q, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
-			if err != nil || q < 0 || q > 1 {
-				q = 0
+			q := parseEncodingQuality(strings.TrimSpace(value))
+			if !hasQuality || q < quality {
+				quality = q
 			}
-			quality = q
+			hasQuality = true
 		}
-		if strings.EqualFold(name, "gzip") {
-			return quality > 0
+		if strings.EqualFold(name, encoding) {
+			if explicit < 0 || quality < explicit {
+				explicit = quality
+			}
+		} else if wildcard < 0 || quality < wildcard {
+			wildcard = quality
 		}
-		wildcard = quality > 0
 	}
-	return wildcard
+	if explicit >= 0 {
+		return explicit
+	}
+	if wildcard >= 0 {
+		return wildcard
+	}
+	return fallback
+}
+
+func parseEncodingQuality(value string) float64 {
+	if value == "" || value[0] != '0' && value[0] != '1' {
+		return 0
+	}
+	if len(value) > 1 {
+		if value[1] != '.' || len(value) > 5 {
+			return 0
+		}
+		for i := 2; i < len(value); i++ {
+			if value[i] < '0' || value[i] > '9' || value[0] == '1' && value[i] != '0' {
+				return 0
+			}
+		}
+	}
+	q, _ := strconv.ParseFloat(value, 64)
+	return q
 }
 
 func (a *AdminServer) api(w http.ResponseWriter, r *http.Request) {
@@ -241,7 +281,7 @@ func (a *AdminServer) api(w http.ResponseWriter, r *http.Request) {
 	case len(parts) == 2 && parts[0] == "upstreams" && r.Method == http.MethodPut:
 		a.putUpstream(w, r, parts[1])
 	case len(parts) == 2 && parts[0] == "upstreams" && r.Method == http.MethodDelete:
-		var removed string
+		var removed Upstream
 		a.mutateThen(w, func(c *Config) (any, error) {
 			i := upstreamIndex(c, parts[1])
 			if i < 0 {
@@ -254,12 +294,12 @@ func (a *AdminServer) api(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			removed = c.Upstreams[i].Auth.SecretFile
+			removed = c.Upstreams[i]
 			c.Upstreams = append(c.Upstreams[:i], c.Upstreams[i+1:]...)
 			return map[string]string{"deleted": parts[1]}, nil
 		}, func(ok bool) {
 			if ok {
-				a.removeManagedSecret(removed)
+				a.removeUpstreamSecrets(removed)
 			}
 		})
 	default:
@@ -326,6 +366,7 @@ func (a *AdminServer) updateKey(w http.ResponseWriter, r *http.Request, id strin
 }
 
 var errNotFound = errors.New("not found")
+var errPreconditionFailed = errors.New("precondition failed")
 
 // mutate applies fn to a copy of the configuration, validates it, persists it
 // and only then activates it.
@@ -348,6 +389,10 @@ func (a *AdminServer) mutateThen(w http.ResponseWriter, fn func(*Config) (any, e
 		return
 	}
 	result, err := fn(next)
+	if errors.Is(err, errPreconditionFailed) {
+		writeError(w, http.StatusPreconditionFailed, "precondition_failed", "an upstream with this name already exists")
+		return
+	}
 	if errors.Is(err, errNotFound) {
 		writeError(w, http.StatusNotFound, "not_found", "no such item")
 		return
@@ -421,9 +466,10 @@ type stateUpstream struct {
 }
 
 func (a *AdminServer) state() any {
-	cfg := a.gw.Config()
+	st := a.gw.state.Load()
+	cfg := st.cfg
 	stats, fwd, denied := a.gw.events.snapshot()
-	problems := a.gw.Problems()
+	problems := st.problems
 	now := a.gw.now()
 	keys := make([]stateKey, 0, len(cfg.Keys))
 	for _, k := range cfg.Keys {
@@ -445,7 +491,7 @@ func (a *AdminServer) state() any {
 	}
 	return map[string]any{
 		"proxy":          cfg.Proxy != nil,
-		"proxy_https":    a.gw.state.Load().ca != nil,
+		"proxy_https":    st.ca != nil,
 		"outbound_proxy": outbound,
 		"gateway_url":    a.gatewayURL,
 		"persistent":     a.path != "",
@@ -473,10 +519,23 @@ func (a *AdminServer) login(w http.ResponseWriter, r *http.Request) {
 	}
 	a.sessMu.Lock()
 	now := time.Now()
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		delete(a.sessions, HashKey(c.Value)) // replace this browser's session
+	}
 	for h, exp := range a.sessions { // bound memory: drop expired sessions
-		if now.After(exp) {
+		if !now.Before(exp) {
 			delete(a.sessions, h)
 		}
+	}
+	if len(a.sessions) >= maxAdminSessions {
+		var oldestHash string
+		var oldest time.Time
+		for h, exp := range a.sessions {
+			if oldestHash == "" || exp.Before(oldest) {
+				oldestHash, oldest = h, exp
+			}
+		}
+		delete(a.sessions, oldestHash)
 	}
 	a.sessions[HashKey(sid)] = now.Add(12 * time.Hour)
 	a.sessMu.Unlock()

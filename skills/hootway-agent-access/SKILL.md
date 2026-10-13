@@ -17,6 +17,7 @@ Hootway replaces a real API credential with a revocable virtual key (`hw_…`) a
 - `405 proxy_disabled`: use the gateway URL with `/<upstream>/<path>` or ask the operator to enable proxy mode.
 - `403 forbidden`: method/path not granted — report the exact method and path you need instead of trying other paths.
 - `400 bad_path`: remove `..`, `//`, encoded separators/dots/percent signs and control bytes from the path.
+- `400 bad_query`: fix malformed percent escapes and encode literal query semicolons as `%3B`; rejected queries never reach the upstream.
 - `429 rate_limited`: wait for `Retry-After` seconds.
 - `502 upstream_unreachable`: upstream failed; for writes the result may be uncertain — read back before retrying.
 - `503 proxy_busy`: the gateway has reached its simultaneous tunnel limit; wait for `Retry-After` before reconnecting.

@@ -18,30 +18,34 @@ $("#theme").addEventListener("click", () => {
 });
 
 // api
-async function api(method, path, body) {
+async function api(method, path, body, signal, headers = {}) {
   const session = state.session;
   const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) abort(); else signal?.addEventListener("abort", abort, { once: true });
   requests.add(controller);
   const deadline = setTimeout(() => controller.abort(), 30000);
   try {
     const res = await fetch("/api" + path, {
       method,
       signal: controller.signal,
-      headers: { "Content-Type": "application/json", "X-Hootway-Console": "1" },
+      headers: { "Content-Type": "application/json", "X-Hootway-Console": "1", ...headers },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     let data = null;
     try { data = await res.json(); } catch (err) { if (controller.signal.aborted) throw err; }
     if (session !== state.session) throw new Error("Signed out");
+    if (signal?.aborted) throw new Error("Request cancelled");
     if (res.status === 401 && path !== "/session") { showLogin(); throw new Error("Signed out"); }
     if (!res.ok) throw new Error(data?.error?.message || `Request failed (${res.status})`);
     if (data === null) throw new Error("The gateway returned an invalid response. Refresh its state before retrying.");
     return data;
   } catch (err) {
     if (session !== state.session) throw new Error("Signed out");
-    if (err.name === "AbortError") throw new Error(method === "GET" ? "The request timed out. Try again." : "The request timed out and may have applied. Refresh the gateway state before retrying.");
+    if (signal?.aborted) throw new Error("Request cancelled");
+    if (err.name === "AbortError") throw new Error(method === "GET" || ["/probe", "/explain"].includes(path) ? "The request timed out. Try again." : "The request timed out and may have applied. Refresh the gateway state before retrying.");
     throw err;
-  } finally { clearTimeout(deadline); requests.delete(controller); }
+  } finally { clearTimeout(deadline); signal?.removeEventListener("abort", abort); requests.delete(controller); }
 }
 
 // Builds DOM nodes; text is always inserted as text, never parsed as HTML.
@@ -66,23 +70,32 @@ function toast(msg) {
 
 function setError(sel, msg) { const e = $(sel); e.textContent = msg || ""; e.hidden = !msg; }
 
-async function busy(btn, fn) {
-  if (btn.disabled) return;
-  const dlg = btn.closest("dialog");
+const busyLocks = new WeakMap();
+async function busy(btn, fn, lockDialog = true, signal) {
+  if (btn.disabled || signal?.aborted) return;
+  const dlg = lockDialog ? btn.closest("dialog") : null;
   const controls = dlg ? [...dlg.querySelectorAll("input, select, textarea, button")] : [btn];
   const disabled = controls.map((c) => c.disabled);
-  for (const c of controls) c.disabled = true;
-  if (dlg) { dlg.dataset.pending = "1"; dlg.setAttribute("aria-busy", "true"); }
-  try { return await fn(); } finally {
-    controls.forEach((c, i) => (c.disabled = disabled[i]));
-    if (dlg) { delete dlg.dataset.pending; dlg.removeAttribute("aria-busy"); }
-  }
+  const lock = {};
+  for (const c of controls) { busyLocks.set(c, lock); c.disabled = true; }
+  if (dlg) { busyLocks.set(dlg, lock); dlg.dataset.pending = "1"; dlg.setAttribute("aria-busy", "true"); }
+  const release = () => {
+    controls.forEach((c, i) => { if (busyLocks.get(c) === lock) { busyLocks.delete(c); c.disabled = disabled[i]; } });
+    if (dlg && busyLocks.get(dlg) === lock) { busyLocks.delete(dlg); delete dlg.dataset.pending; dlg.removeAttribute("aria-busy"); }
+  };
+  signal?.addEventListener("abort", release, { once: true });
+  try { return await fn(); } finally { signal?.removeEventListener("abort", release); release(); }
 }
 
 function wholeNumber(raw, label) {
   const value = raw.trim() || "0";
   if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error(`${label} must be a whole number of 0 or more.`);
   return Number(value);
+}
+function numberField(selector, label) {
+  const input = $(selector);
+  if (input.validity?.badInput) throw new Error(`${label} must be a whole number of 0 or more.`);
+  return wholeNumber(input.value, label);
 }
 
 // session
@@ -257,6 +270,7 @@ function renderUpstreams() {
 }
 
 function renderCheckKeys() {
+  $("#check-result").hidden = true;
   const sel = $("#check-key");
   const cur = sel.value;
   sel.replaceChildren(...state.data.keys.map((k) => el("option", { value: k.id }, k.id)));
@@ -319,7 +333,7 @@ function readKeyForm() {
     if (!g.paths.length) throw new Error("Each rule needs at least one path.");
   }
   const exp = $("#key-expires").value;
-  const rpm = wholeNumber($("#key-rpm").value, "Requests per minute");
+  const rpm = numberField("#key-rpm", "Requests per minute");
   const expires = state.editingKey && exp === toLocalInput(state.editingKey.expires_at)
     ? state.editingKey.expires_at || null : exp ? new Date(exp).toISOString() : null;
   return {
@@ -348,7 +362,10 @@ $("#key-form").addEventListener("submit", async (e) => {
 
 function shellQuote(value) { return "'" + String(value).replace(/'/g, "'\"'\"'") + "'"; }
 
+let secretCopyController;
+function cancelSecretCopy() { secretCopyController?.abort(); secretCopyController = null; }
 function showSecret(key, upstream, hint, createdUpstream) {
+  cancelSecretCopy();
   $("#secret-value").textContent = key;
   const base = state.data.gateway_url + "/" + (upstream || "jira");
   const p = hint?.env || "HOOTWAY";
@@ -360,23 +377,35 @@ export ${p}_TOKEN=${shellQuote(key)}
 ${curl}`;
   const up = createdUpstream || state.data.upstreams.find((u) => u.name === upstream);
   if (state.data.proxy && up) {
-    const gw = new URL(state.data.gateway_url);
+    let gw;
+    try { gw = new URL(state.data.gateway_url); } catch { /* the one-time key must remain accessible */ }
+    if (gw && ["http:", "https:"].includes(gw.protocol) && !gw.username && !gw.password && !gw.search && !gw.hash) {
     const proxy = `${gw.protocol}//hootway:${key}@${gw.host}`;
     snippet += `
 
 # or keep the real URL and use Hootway as proxy${up.base_url.startsWith("https:") && !state.data.proxy_https ? " (https needs a proxy CA on the gateway)" : ""}
 export HTTPS_PROXY=${shellQuote(proxy)} HTTP_PROXY=${shellQuote(proxy)}${up.base_url.startsWith("https:") ? "\n# trust the Hootway proxy CA: export SSL_CERT_FILE=/path/to/hootway-ca.pem" : ""}
 curl ${shellQuote(up.base_url.replace(/\/+$/, "") + (hint?.test || "/…"))}`;
+    } else {
+      snippet += "\n\n# Proxy instructions unavailable: configure a valid public gateway URL.";
+    }
   }
   $("#secret-snippet").textContent = snippet;
   $("#secret-dialog").showModal();
   $("#copy-secret").focus();
 }
-$("#copy-secret").addEventListener("click", async () => {
-  try { await navigator.clipboard.writeText($("#secret-value").textContent); toast("Copied"); }
-  catch { getSelection().selectAllChildren($("#secret-value")); toast("Press ⌘C / Ctrl+C to copy"); }
+$("#copy-secret").addEventListener("click", () => {
+  const btn = $("#copy-secret");
+  if (btn.disabled) return;
+  const controller = new AbortController(); secretCopyController = controller;
+  return busy(btn, async () => {
+    const key = $("#secret-value").textContent, session = state.session;
+    const current = () => !controller.signal.aborted && session === state.session && $("#secret-dialog").open && $("#secret-value").textContent === key;
+    try { await navigator.clipboard.writeText(key); if (current()) toast("Copied"); }
+    catch { if (current()) { getSelection()?.selectAllChildren($("#secret-value")); toast("Press ⌘C / Ctrl+C to copy"); } }
+  }, false, controller.signal);
 });
-$("#secret-dialog").addEventListener("close", () => { $("#secret-value").textContent = ""; $("#secret-snippet").textContent = ""; });
+$("#secret-dialog").addEventListener("close", () => { cancelSecretCopy(); $("#secret-value").textContent = ""; $("#secret-snippet").textContent = ""; });
 
 function keyBody(k, patch) {
   return { id: k.id, description: k.description || "", disabled: k.disabled, expires_at: k.expires_at || null,
@@ -401,10 +430,11 @@ function deleteKey(k) {
 }
 
 function confirmAction(title, text, label, fn) {
+  setError("#confirm-error");
   $("#confirm-title").textContent = title; $("#confirm-text").textContent = text; $("#confirm-ok").textContent = label;
   const dlg = $("#confirm-dialog");
   $("#confirm-ok").onclick = () => busy($("#confirm-ok"), async () => {
-    try { await fn(); dlg.close(); } catch (err) { dlg.close(); toast(err.message); }
+    try { await fn(); dlg.close(); } catch (err) { if (dlg.open) setError("#confirm-error", err.message); }
   });
   dlg.showModal();
   dlg.querySelector("[data-close]").focus();
@@ -458,6 +488,7 @@ $("#up-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const name = $("#up-name").value.trim();
   if (!/^[a-z0-9][a-z0-9_-]{0,62}$/.test(name)) return setError("#up-error", "Name: use lowercase letters, digits, - and _.");
+  if (!state.editingUpstream && state.data.upstreams.some((u) => u.name === name)) return setError("#up-error", "An upstream with this name already exists. Edit that connection or choose a different name.");
   const type = $("#up-auth").value;
   const auth = { type };
   const v = (s) => $(s).value.trim();
@@ -466,7 +497,7 @@ $("#up-form").addEventListener("submit", async (e) => {
   if (type === "basic") { if (v("#up-user")) auth.username = v("#up-user"); if (v("#up-user-env")) auth.username_env = v("#up-user-env"); }
   if (type !== "none") { if (v("#up-secret-env")) auth.secret_env = v("#up-secret-env"); if (v("#up-secret-file")) auth.secret_file = v("#up-secret-file"); }
   const secret = type !== "none" ? $("#up-secret").value.trim() : "";
-  const headers = {};
+  const headers = Object.create(null);
   for (const line of $("#up-headers").value.split("\n")) {
     if (!line.trim()) continue;
     const i = line.indexOf(":");
@@ -474,7 +505,7 @@ $("#up-form").addEventListener("submit", async (e) => {
     headers[line.slice(0, i).trim()] = line.slice(i + 1).trim();
   }
   let timeout;
-  try { timeout = wholeNumber($("#up-timeout").value, "Timeout seconds"); } catch (err) { return setError("#up-error", err.message); }
+  try { timeout = numberField("#up-timeout", "Timeout seconds"); } catch (err) { return setError("#up-error", err.message); }
   const body = { name, base_url: v("#up-url"), description: v("#up-desc"), auth, timeout_seconds: timeout };
   if (Object.keys(headers).length) body.headers = headers;
   const egress = $("#up-egress").value;
@@ -486,7 +517,7 @@ $("#up-form").addEventListener("submit", async (e) => {
   if (secret) body.secret = secret;
   await busy($("#up-save"), async () => {
     try {
-      await api("PUT", "/upstreams/" + encodeURIComponent(name), body);
+      await api("PUT", "/upstreams/" + encodeURIComponent(name), body, undefined, state.editingUpstream ? {} : { "If-None-Match": "*" });
       $("#up-secret").value = "";
       $("#up-dialog").close(); await refresh();
       const now = state.data.upstreams.find((u) => u.name === name);
@@ -496,9 +527,8 @@ $("#up-form").addEventListener("submit", async (e) => {
 });
 $("#up-delete").addEventListener("click", () => {
   const u = state.editingUpstream;
-  $("#up-dialog").close();
   confirmAction(`Delete /${u.name}?`, "Keys cannot reach this API afterwards. Remove its access rules from keys first.", "Delete", async () => {
-    await api("DELETE", "/upstreams/" + encodeURIComponent(u.name)); toast("Upstream deleted"); await refresh();
+    await api("DELETE", "/upstreams/" + encodeURIComponent(u.name)); $("#up-dialog").close(); toast("Upstream deleted"); await refresh();
   });
 });
 
@@ -537,7 +567,7 @@ async function pollEvents(generation) {
 $("#activity-filter").addEventListener("change", () => renderEvents());
 const outcomeText = {
   forwarded: "forwarded", forbidden: "not allowed", invalid_key: "invalid key", missing_key: "no key",
-  bad_path: "unsafe path", rate_limited: "rate limited", upstream_error: "upstream failed", upstream_unconfigured: "no credential",
+  bad_path: "unsafe path", bad_query: "unsafe query", rate_limited: "rate limited", upstream_error: "upstream failed", upstream_unconfigured: "no credential",
   tunnel: "tunnel opened", not_an_upstream: "unknown upstream", upstream_unreachable: "upstream unreachable", bad_request: "bad request",
 };
 function renderEvents() {
@@ -569,14 +599,15 @@ $("#check-form").addEventListener("submit", (e) => {
   const verdict = (ok, title, text) => { out.className = "verdict " + (ok ? "ok" : "no"); out.replaceChildren(el("strong", {}, title), text); out.hidden = false; };
   const path = $("#check-path").value.trim();
   const key = $("#check-key").value, method = $("#check-method").value;
+  const revision = state.refresh;
   if (!key) return verdict(false, "No keys", "Create a key first.");
   if (!path) { $("#check-path").focus(); return verdict(false, "Missing path", "Enter a path such as /jira/rest/api/3/myself."); }
   return busy(e.submitter || $("#check-form button"), async () => {
     try {
       const r = await api("POST", "/explain", { key, method, path });
-      if ($("#check-key").value === key && $("#check-method").value === method && $("#check-path").value.trim() === path) verdict(r.allowed, r.allowed ? "Allowed" : "Denied", r.reason);
+      if (revision === state.refresh && $("#check-key").value === key && $("#check-method").value === method && $("#check-path").value.trim() === path) verdict(r.allowed, r.allowed ? "Allowed" : "Denied", r.reason);
     } catch (err) {
-      if (err.message !== "Signed out" && $("#check-key").value === key && $("#check-method").value === method && $("#check-path").value.trim() === path) verdict(false, "Error", err.message);
+      if (revision === state.refresh && err.message !== "Signed out" && $("#check-key").value === key && $("#check-method").value === method && $("#check-path").value.trim() === path) verdict(false, "Error", err.message);
     }
   });
 });
@@ -684,7 +715,7 @@ function wizSteps() {
 
 function openWizard() {
   if (!state.data) return toast("Wait for the gateway state to load.");
-  Object.assign(wiz, { step: "pick", preset: null, variant: null, level: "read", values: {}, reuse: null, created: null, tested: null, rules: null, probe: 0 });
+  Object.assign(wiz, { step: "pick", preset: null, variant: null, level: "read", values: {}, reuse: null, created: null, tested: null, rules: null, probe: (wiz.probe || 0) + 1 });
   $("#wiz-reuse-box").checked = true;
   $("#wiz-key-id").value = ""; delete $("#wiz-key-id").dataset.touched;
   $("#wiz-rpm").value = "120"; $("#wiz-expires").value = "90";
@@ -787,6 +818,7 @@ function updateProgress() {
 
 function go(dir) {
   if (wiz.step === "key") rememberRules();
+  if (wiz.step === "token") resetProbe();
   const s = wizSteps();
   const i = s.indexOf(wiz.step);
   const next = s[Math.min(s.length - 1, Math.max(0, i + dir))];
@@ -808,6 +840,7 @@ function syncSource() {
 }
 function resetProbe() {
   wiz.probe = (wiz.probe || 0) + 1; wiz.tested = null;
+  wiz.probeController?.abort(); wiz.probeController = null;
   delete $("#wiz-next").dataset.confirm;
   $("#wiz-test-result").textContent = ""; $("#wiz-test-result").className = "test-result";
 }
@@ -830,6 +863,7 @@ function enterToken() {
 }
 
 async function testToken(btn) {
+  if (btn.disabled) return;
   const out = $("#wiz-test-result");
   const body = { upstream: draftUpstream("draft"), path: pv("test") };
   if (tokenSource() === "paste") {
@@ -841,16 +875,18 @@ async function testToken(btn) {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(body.upstream.auth.secret_env)) { out.className = "test-result bad"; out.textContent = "Enter an environment variable name first."; $("#wiz-env").focus(); return; }
   }
   const probe = ++wiz.probe;
+  const controller = new AbortController();
+  wiz.probeController = controller;
   out.className = "test-result"; out.textContent = "Testing…";
   await busy(btn, async () => {
     try {
-      const r = await api("POST", "/probe", body);
+      const r = await api("POST", "/probe", body, controller.signal);
       if (probe !== wiz.probe || !$("#wiz").open || wiz.step !== "token") return;
       wiz.tested = r.ok;
       out.className = "test-result " + (r.ok ? "ok" : "bad");
       out.textContent = (r.ok ? "✓ " : "") + r.message[0].toUpperCase() + r.message.slice(1) + (r.status && !r.ok ? ` (${r.status})` : "");
     } catch (err) { if (probe === wiz.probe && $("#wiz").open) { out.className = "test-result bad"; out.textContent = err.message; } }
-  });
+  }, false, controller.signal);
 }
 $("#wiz-test").addEventListener("click", (e) => testToken(e.currentTarget));
 
@@ -918,7 +954,7 @@ async function createFromWizard() {
   if (!grants.length) return setError("#wiz-error", "Keep at least one access rule.");
   if (grants.some((g) => !g.methods.length || !g.paths.length)) return setError("#wiz-error", "Each access rule needs at least one method and one path.");
   let rpm;
-  try { rpm = wholeNumber($("#wiz-rpm").value, "Per minute"); } catch (err) { return setError("#wiz-error", err.message); }
+  try { rpm = numberField("#wiz-rpm", "Per minute"); } catch (err) { return setError("#wiz-error", err.message); }
   const days = $("#wiz-expires").value;
   const expires = days ? new Date(Date.now() + days * 86400000).toISOString() : null;
   try {
@@ -926,7 +962,7 @@ async function createFromWizard() {
       const up = draftUpstream(name);
       if (tokenSource() === "paste") up.secret = $("#wiz-secret").value.trim();
       else up.auth.secret_env = $("#wiz-env").value.trim();
-      const saved = await api("PUT", "/upstreams/" + encodeURIComponent(name), up);
+      const saved = await api("PUT", "/upstreams/" + encodeURIComponent(name), up, undefined, { "If-None-Match": "*" });
       $("#wiz-secret").value = "";
       // A retry after a failed key creation must not create a second upstream.
       wiz.created = saved; wiz.reuse = saved; $("#wiz-reuse-box").checked = true;

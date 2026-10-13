@@ -28,6 +28,9 @@ func resolveCredential(a Auth, getenv func(string) string) (credential, error) {
 	}
 	switch a.Type {
 	case "bearer":
+		if !validHeaderValue(secret) {
+			return credential{}, errors.New("secret contains invalid HTTP header control bytes")
+		}
 		return credential{auth: a, value: "Bearer " + secret, secret: secret}, nil
 	case "basic":
 		user := a.Username
@@ -43,6 +46,9 @@ func resolveCredential(a Auth, getenv func(string) string) (credential, error) {
 		token := base64.StdEncoding.EncodeToString([]byte(user + ":" + secret))
 		return credential{auth: a, value: "Basic " + token, secret: secret}, nil
 	case "header":
+		if !validHeaderValue(a.Prefix + secret) {
+			return credential{}, errors.New("credential contains invalid HTTP header control bytes")
+		}
 		return credential{auth: a, value: a.Prefix + secret, secret: secret}, nil
 	case "query":
 		return credential{auth: a, value: secret, secret: secret}, nil

@@ -40,13 +40,15 @@ jobs:
         id: v
         run: |
           tag="${GITHUB_REF_NAME}"
-          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]] || { echo "bad tag $tag" >&2; exit 2; }
+          [[ "$tag" == v* ]] || { echo 'release tag must start with v' >&2; exit 2; }
+          bash scripts/validate-version.sh "${tag#v}"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
       - name: Verify release revision
         run: |
           test -z "$(gofmt -l .)"
           go vet ./...
           go test -race ./...
+          bash scripts/release.test.sh
           node --check internal/gateway/web/app.js
           node --check internal/gateway/web/presets.js
           node --test scripts/console.test.mjs

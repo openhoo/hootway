@@ -106,6 +106,13 @@ func (a *AdminServer) removeManagedSecret(file string) {
 	_ = os.Remove(file)
 }
 
+func (a *AdminServer) removeUpstreamSecrets(up Upstream) {
+	a.removeManagedSecret(up.Auth.SecretFile)
+	if up.OutboundProxy != nil {
+		a.removeManagedSecret(up.OutboundProxy.SecretFile)
+	}
+}
+
 func checkSecret(s string) error {
 	if s == "" || len(s) > maxSecretLen || strings.ContainsAny(s, "\r\n\x00") {
 		return errors.New("the secret must be a single line of at most 8 KiB")
@@ -191,13 +198,17 @@ func (a *AdminServer) putUpstream(w http.ResponseWriter, r *http.Request, name s
 		written = p
 		up.Auth.SecretEnv, up.Auth.SecretFile = "", p
 	}
-	var previous string
+	var previous Upstream
+	createOnly := strings.TrimSpace(r.Header.Get("If-None-Match")) == "*"
 	a.mutateThen(w, func(c *Config) (any, error) {
 		i := upstreamIndex(c, name)
+		if createOnly && i >= 0 {
+			return nil, errPreconditionFailed
+		}
 		if i < 0 {
 			c.Upstreams = append(c.Upstreams, up)
 		} else {
-			previous = c.Upstreams[i].Auth.SecretFile
+			previous = c.Upstreams[i]
 			c.Upstreams[i] = up
 		}
 		return up, nil
@@ -205,8 +216,8 @@ func (a *AdminServer) putUpstream(w http.ResponseWriter, r *http.Request, name s
 		switch {
 		case !ok:
 			a.removeManagedSecret(written)
-		case previous != up.Auth.SecretFile:
-			a.removeManagedSecret(previous)
+		default:
+			a.removeUpstreamSecrets(previous)
 		}
 	})
 }
@@ -261,7 +272,12 @@ func (a *AdminServer) probe(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusUnprocessableEntity, "invalid", err.Error())
 				return
 			}
-			const draftEnv = "HOOTWAY_DRAFT_SECRET"
+			draftEnv := "HOOTWAY_DRAFT_SECRET"
+			// The temporary password source must not shadow an operator's
+			// independently configured environment-backed Basic username.
+			if draftEnv == up.Auth.UsernameEnv {
+				draftEnv += "_"
+			}
 			up.Auth.SecretEnv, up.Auth.SecretFile = draftEnv, ""
 			getenv = func(k string) string {
 				if k == draftEnv {
