@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -138,20 +139,22 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return nil
 	}
 	fmt.Fprint(stderr, usage)
-	return usageError{fmt.Sprintf("unknown command %q", args[0])}
+	return usageError{"unknown command (see: hootway help)"}
 }
 
 func serveOrCheck(cmd string, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("hootway "+cmd, flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	var flagOutput strings.Builder
+	fs.SetOutput(&flagOutput)
 	path := fs.String("config", envOr("HOOTWAY_CONFIG", "hootway.json"), "configuration `file` (env HOOTWAY_CONFIG)")
 	listen := fs.String("listen", "", "override the gateway listen `address`")
 	adminListen := fs.String("admin-listen", "", "enable the web console on this `address`")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprint(stderr, flagOutput.String())
 			return nil
 		}
-		return usageError{err.Error()}
+		return usageError{"invalid options (see: hootway " + cmd + " -h)"}
 	}
 	if fs.NArg() > 0 {
 		return usageError{"unexpected positional argument"}
@@ -192,12 +195,46 @@ func serveOrCheck(cmd string, args []string, stdout, stderr io.Writer) error {
 		if cfg.Admin.Listen == cfg.Listen {
 			return errors.New("admin.listen must differ from listen so agents cannot reach the console")
 		}
-		gwURL := envOr("HOOTWAY_PUBLIC_URL", "http://"+cfg.Listen)
+		gwURL, err := advertisedGatewayURL(cfg.Listen, os.Getenv("HOOTWAY_PUBLIC_URL"))
+		if err != nil {
+			return err
+		}
 		servers = append(servers, newServer(cfg.Admin.Listen, gateway.NewAdmin(gw, *path, hash, gwURL)))
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return serve(ctx, servers, logger)
+}
+
+// advertisedGatewayURL turns wildcard bind addresses into usable local examples.
+// A remote sandbox needs HOOTWAY_PUBLIC_URL set to an address it can reach.
+func advertisedGatewayURL(listen, publicURL string) (string, error) {
+	if publicURL == "" {
+		host, port, err := net.SplitHostPort(listen)
+		if err != nil {
+			return "", errors.New("listen must include a host and port for console examples")
+		}
+		portNumber, err := net.LookupPort("tcp", port)
+		if err != nil {
+			return "", errors.New("listen has an invalid port for console examples")
+		}
+		if host == "" || host == "0.0.0.0" {
+			host = "127.0.0.1"
+		} else if host == "::" {
+			host = "::1"
+		}
+		publicURL = "http://" + net.JoinHostPort(host, fmt.Sprintf("%d", portNumber))
+	}
+	u, err := url.Parse(publicURL)
+	if err != nil || u.Scheme != "http" && u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(publicURL, "#") {
+		return "", errors.New("HOOTWAY_PUBLIC_URL must be an http(s) URL without credentials, query or fragment")
+	}
+	if port := u.Port(); port != "" {
+		if _, err := net.LookupPort("tcp", port); err != nil {
+			return "", errors.New("HOOTWAY_PUBLIC_URL has an invalid port")
+		}
+	}
+	return strings.TrimRight(u.String(), "/"), nil
 }
 
 func newServer(addr string, h http.Handler) *http.Server {
@@ -290,15 +327,17 @@ func envOr(k, def string) string {
 
 func proxyCA(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("hootway proxy ca", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	var flagOutput strings.Builder
+	fs.SetOutput(&flagOutput)
 	cert := fs.String("cert", "hootway-ca.pem", "CA certificate `file` to create (give it to agent sandboxes)")
 	key := fs.String("key", "hootway-ca-key.pem", "CA private key `file` to create (0600; keep it on the gateway)")
 	days := fs.Int("days", 365, "validity in `days`")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprint(stderr, flagOutput.String())
 			return nil
 		}
-		return usageError{err.Error()}
+		return usageError{"invalid options (see: hootway proxy ca -h)"}
 	}
 	// Bound before converting to a nanosecond duration so large values cannot
 	// wrap and create an already-expired certificate.

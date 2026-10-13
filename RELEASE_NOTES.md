@@ -1,5 +1,33 @@
 Hootway lets agent sandboxes call logged-in APIs such as Jira with scoped virtual keys instead of real credentials.
 
+## Changes in 0.4.3
+
+### Gateway and credentials
+
+- Redact credentials from rejected and unknown-route audit events using the request's configuration snapshot, including failures during a credential reload
+- Resolve same-origin relative, root-relative and network-path redirects back through the gateway; preserve escaped paths, query and fragment semantics, and remove inherited query credentials
+- Reject malformed query escapes and raw semicolons with `400 bad_query` before forwarding instead of silently dropping query fields; Check follows the same decision order
+- Reject unusable control bytes in static headers, auth prefixes and resolved bearer/header credentials before activation
+
+### Admin and console
+
+- Repeated login replaces the current browser's old session; keep at most 256 browser sessions and retire the oldest at capacity
+- Mark login and logout cookies Secure for direct TLS and HTTPS reverse proxies using `X-Forwarded-Proto: https`, while preserving localhost HTTP sessions
+- Clean up managed outbound-proxy passwords when their upstream is replaced or deleted, preserving shared references and credentials after failed changes
+- Keep draft probe passwords separate from environment-backed Basic usernames
+- Give gzip and plain console assets separate strong ETags, handle repeated encoding/cache headers, and return 406 when both representations are refused
+- Support atomic create-only upstream PUT with `If-None-Match: *`; console creation returns a conflict instead of overwriting another operator's connection
+- Keep upstream drafts open after cancelled or failed deletion; keep read-only probes cancellable and prevent an old wizard probe from approving a new token
+- Clear obsolete Check verdicts and clipboard feedback; validate browser number-input errors before a quota can become unlimited
+- Normalize wildcard listener addresses for local console examples, validate `HOOTWAY_PUBLIC_URL`, and preserve the one-time key display even if proxy instructions cannot be built
+
+### Release quality
+
+- Avoid reflecting unexpected CLI options or values in usage errors while preserving command help
+- Validate prerelease identifiers consistently in local builds and the release workflow, including numeric leading-zero rules
+- Link archive README screenshots to the exact released source revision
+- Add focused Go, console and release-version regressions and refresh console screenshots
+
 ## Changes in 0.4.2
 
 ### Credential and policy boundary

@@ -33,6 +33,8 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: Vet
         run: go vet ./...
+      - name: Release version regressions
+        run: bash scripts/release.test.sh
       - name: Console regressions
         run: |
           node --check internal/gateway/web/app.js

@@ -261,7 +261,7 @@ func (c *Config) validate() error {
 		for h := range u.Headers {
 			if isProtectedHeader(h) {
 				errs = append(errs, fmt.Errorf("upstream %q: header %q cannot be set statically", u.Name, h))
-			} else if !validHeaderName(h) || strings.ContainsAny(u.Headers[h], "\r\n\x00") {
+			} else if !validHeaderName(h) || !validHeaderValue(u.Headers[h]) {
 				errs = append(errs, fmt.Errorf("upstream %q: header %q has an invalid name or value", u.Name, h))
 			}
 		}
@@ -349,7 +349,19 @@ func (a Auth) validate() error {
 	if strings.ContainsAny(a.Prefix+a.Username, "\r\n\x00") || strings.Contains(a.Username, ":") {
 		return errors.New("prefix and username must not contain line breaks, NUL or (username) colons")
 	}
+	if a.Type == "header" && !validHeaderValue(a.Prefix) {
+		return errors.New("auth prefix contains an invalid HTTP header value")
+	}
 	return nil
+}
+
+func validHeaderValue(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < ' ' && s[i] != '\t' || s[i] == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func validatePattern(p string) error {

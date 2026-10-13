@@ -7,6 +7,29 @@ import (
 
 var errUnsafePath = errors.New("unsafe request path")
 
+// checkQuery rejects syntax that net/url and ReverseProxy would silently
+// discard while parsing the query. A valid query is forwarded byte for byte
+// unless the route intentionally replaces its credential parameter.
+func checkQuery(query string) error {
+	for i := 0; i < len(query); i++ {
+		switch query[i] {
+		case ';':
+			return errUnsafePath
+		case '%':
+			if i+2 >= len(query) {
+				return errUnsafePath
+			}
+			_, hiOK := sensitiveHexDigit(query[i+1])
+			_, loOK := sensitiveHexDigit(query[i+2])
+			if !hiOK || !loOK {
+				return errUnsafePath
+			}
+			i += 2
+		}
+	}
+	return nil
+}
+
 // splitRoute splits an escaped request path into the upstream name and the
 // upstream-relative path. It rejects encodings that could make the path seen
 // by the policy differ from the path interpreted by the upstream: encoded

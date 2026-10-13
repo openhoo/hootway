@@ -7,10 +7,7 @@ source_date_epoch="${SOURCE_DATE_EPOCH:-$(git show -s --format=%ct HEAD)}"
 dist_dir="${DIST_DIR:-$(pwd)/dist}"
 [[ "$dist_dir" == /* ]] || dist_dir="$(pwd)/$dist_dir"
 
-if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
-  echo "VERSION must be semantic without a v prefix" >&2
-  exit 2
-fi
+bash scripts/validate-version.sh "$version"
 if ! tar --version 2>/dev/null | grep -q 'GNU tar'; then
   echo "reproducible archives need GNU tar (gtar on macOS)" >&2
   exit 2
@@ -37,7 +34,9 @@ build_one() {
     -ldflags="-s -w -buildid= -X main.version=${version} -X main.commit=${commit}" \
     -o "$stage/hootway${suffix}" ./cmd/hootway
   # Ship only what a user needs: the binary, licence, quick start and example config.
-  cp LICENSE README.md "$stage/"
+  cp LICENSE "$stage/"
+  # Screenshots stay in the repository; resolve them for the standalone README.
+  sed 's|(docs/screenshots/|(https://raw.githubusercontent.com/openhoo/hootway/'"${commit}"'/docs/screenshots/|g' README.md > "$stage/README.md"
   mkdir -p "$stage/examples"
   cp examples/*.json "$stage/examples/"
   find "$stage" -exec touch -h -d "@${source_date_epoch}" {} + 2>/dev/null || find "$stage" -exec touch --date="@${source_date_epoch}" {} +

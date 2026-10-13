@@ -208,7 +208,7 @@ func TestConsoleAssetsCompressedAndRevalidated(t *testing.T) {
 	if res := get("/app.js", nil); res.Header.Get("Content-Encoding") != "" {
 		t.Fatal("gzip without Accept-Encoding")
 	}
-	if res := get("/app.js", map[string]string{"If-None-Match": res.Header.Get("ETag")}); res.StatusCode != http.StatusNotModified {
+	if res := get("/app.js", map[string]string{"Accept-Encoding": "gzip", "If-None-Match": res.Header.Get("ETag")}); res.StatusCode != http.StatusNotModified {
 		t.Fatalf("revalidate: %d", res.StatusCode)
 	}
 	if res := get("/keys", nil); res.StatusCode != 200 || !strings.HasPrefix(res.Header.Get("Content-Type"), "text/html") {

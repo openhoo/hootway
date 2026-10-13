@@ -13,24 +13,32 @@ const bindingsScript = new vm.Script("({ state, wiz, PRESETS })");
 function consoleHarness() {
   const nodes = new Map(), groups = new Map();
   class Node {
-    constructor() { this.value = ""; this.textContent = ""; this.dataset = {}; this.children = []; this.listeners = new Map(); this.hidden = false; this.disabled = false; this.isConnected = true; this.className = ""; this.fields = new Map(); }
-    addEventListener(name, fn) { this.listeners.set(name, fn); }
+    constructor() { this.value = ""; this.textContent = ""; this.dataset = {}; this.children = []; this.listeners = new Map(); this.hidden = false; this.disabled = false; this.isConnected = true; this.className = ""; this.fields = new Map(); this.style = {setProperty() {}}; }
+    get value() { return this.inputValue || ""; }
+    set value(value) { this.inputValue = String(value); }
+    addEventListener(name, fn) { const prev = this.listeners.get(name); this.listeners.set(name, prev ? (...args) => { prev(...args); return fn(...args); } : fn); }
     setAttribute(name, value) { if (name.startsWith("data-")) this.dataset[name.slice(5)] = value; else this[name] = value; }
     removeAttribute(name) { delete this[name]; }
     append(...children) { this.children.push(...children); }
     replaceChildren(...children) { this.children = children; }
     querySelector(selector) { return this.fields.get(selector) || node(selector); }
-    querySelectorAll() { return []; }
-    closest() { return null; }
+    querySelectorAll() { return this.controls || []; }
+    closest(selector) { return selector === "dialog" ? this.dialog || null : null; }
     focus() { document.activeElement = this; }
     select() { this.focus(); }
     showModal() { this.open = true; }
-    close() { this.open = false; this.listeners.get("close")?.(); }
+    close() { if (this.open) { this.open = false; this.listeners.get("close")?.(); } }
   }
   const node = (selector) => { if (!nodes.has(selector)) nodes.set(selector, new Node()); return nodes.get(selector); };
+  const dialogs = ["key-dialog", "wiz", "secret-dialog", "up-dialog", "confirm-dialog"].map((id) => { const d = node("#" + id); d.id = id; return d; });
+  const closes = dialogs.map((d) => { const b = new Node(); b.dialog = d; d.fields.set("[data-close]", b); return b; });
+  for (const [id, selectors] of Object.entries({ "key-dialog": ["#key-save"], wiz: ["#wiz-next", "#wiz-test", "#wiz-secret", "#wiz-env"], "up-dialog": ["#up-save", "#up-delete", "#up-url", "#up-secret"], "confirm-dialog": ["#confirm-ok"] })) {
+    const d = node("#" + id); d.controls = [d.fields.get("[data-close]"), ...selectors.map((s) => { const n = node(s); n.dialog = d; return n; })];
+  }
+  groups.set("dialog", dialogs); groups.set("[data-close]", closes);
   const document = {
     documentElement: new Node(), body: new Node(), hidden: false,
-    querySelector: node, querySelectorAll: (selector) => groups.get(selector) || [],
+    querySelector: node, querySelectorAll: (selector) => selector === "dialog[open]" ? dialogs.filter((d) => d.open) : groups.get(selector) || [],
     createElement: () => new Node(), addEventListener() {}, activeElement: null,
   };
   document.activeElement = document.body;
@@ -201,4 +209,205 @@ test("Bitbucket token instructions show current vendor scope names", () => {
   const h = consoleHarness();
   const help = h.presets.find((p) => p.id === "bitbucket").variants[0].tokenHelp("write");
   for (const scope of ["read:user:bitbucket", "read:repository:bitbucket", "read:pullrequest:bitbucket", "write:pullrequest:bitbucket"]) assert.match(help, new RegExp(scope));
+});
+
+test("New upstream rejects a name already used by another connection", async () => {
+  const h = consoleHarness(); let calls = 0;
+  h.state.data.upstreams = [{name:"jira",base_url:"https://original.example.com",auth:{type:"none"}}];
+  h.context.openUpstream();
+  h.node("#up-name").value = "jira"; h.node("#up-url").value = "https://replacement.example.com";
+  h.node("#up-auth").value = "none";
+  h.context.fetch = async () => { calls++; return response({error:{message:"must not be called"}}, 422); };
+  await h.node("#up-form").listeners.get("submit")({preventDefault() {}});
+  assert.equal(calls, 0);
+  assert.match(h.node("#up-error").textContent, /already exists/);
+});
+
+test("cancelling an upstream deletion keeps the unsaved editor open", () => {
+  const h = consoleHarness();
+  const up = {name:"jira",base_url:"https://original.example.com",auth:{type:"none"}};
+  h.state.data.upstreams = [up]; h.context.openUpstream(up);
+  h.node("#up-desc").value = "unsaved description";
+  h.node("#up-delete").listeners.get("click")();
+  h.node("#confirm-dialog").fields.get("[data-close]").listeners.get("click")();
+  assert.equal(h.node("#up-dialog").open, true);
+  assert.equal(h.node("#up-desc").value, "unsaved description");
+});
+
+test("a failed destructive action preserves its confirmation and shows the error", async () => {
+  const h = consoleHarness();
+  h.context.confirmAction("Delete agent?", "Access will stop", "Delete", async () => { throw new Error("Connection unavailable"); });
+  await h.node("#confirm-ok").onclick();
+  assert.equal(h.node("#confirm-dialog").open, true);
+  assert.equal(h.node("#confirm-error").hidden, false);
+  assert.equal(h.node("#confirm-error").textContent, "Connection unavailable");
+  assert.equal(h.node("#confirm-ok").disabled, false);
+});
+
+test("a read-only token probe remains cancellable and ignores its late result", async () => {
+  const h = consoleHarness(); const d = deferred(); h.context.fetch = () => d.promise;
+  Object.assign(h.wiz, {preset:h.presets.find((p)=>p.id==="github"),variant:"cloud",values:{},probe:0,step:"token"});
+  h.node("#wiz").showModal(); h.node("#wiz-secret").value = "fake";
+  h.node('input[name="wiz-src"]:checked').value = "paste";
+  const pending = h.context.testToken(h.node("#wiz-test"));
+  const cancel = h.node("#wiz").fields.get("[data-close]");
+  assert.equal(cancel.disabled, false);
+  cancel.listeners.get("click")();
+  assert.equal(h.node("#wiz").open, false);
+  assert.equal(h.node("#wiz-secret").value, "");
+  d.resolve(response({ok:true,message:"connection works",status:200})); await pending;
+  assert.equal(h.wiz.tested, null);
+  assert.equal(h.node("#wiz-test-result").textContent, "");
+});
+
+test("refreshing key policy invalidates the previous Check result", () => {
+  const h = consoleHarness();
+  h.node("#check-key").value = "agent"; h.node("#check-result").hidden = false;
+  h.state.data.keys = [{id:"agent",disabled:true,grants:[]}];
+  h.context.renderCheckKeys();
+  assert.equal(h.node("#check-result").hidden, true);
+});
+
+test("clipboard completion after closing the secret dialog shows no stale feedback", async () => {
+  const h = consoleHarness(); const d = deferred();
+  h.context.navigator.clipboard = {writeText:()=>d.promise};
+  h.context.showSecret("hw_fake", "jira");
+  const pending = h.node("#copy-secret").listeners.get("click")();
+  h.node("#secret-dialog").close();
+  d.resolve(); await pending;
+  assert.equal(h.node("#toast").textContent, "");
+  assert.equal(h.node("#secret-value").textContent, "");
+});
+
+test("a number input with badInput cannot silently reset a quota to unlimited", () => {
+  const h = consoleHarness();
+  h.node("#key-id").value = "agent";
+  h.node("#key-rpm").value = ""; h.node("#key-rpm").validity = {badInput:true};
+  const row = new h.Node();
+  for (const [selector,value] of [[".g-up","jira"],[".g-methods","GET"],[".g-paths","/rest/api/3/myself"]]) { const n = new h.Node(); n.value=value; row.fields.set(selector,n); }
+  h.groups.set("#grant-rows .grant", [row]);
+  assert.throws(()=>h.context.readKeyForm(), /whole number/);
+});
+
+test("closing and reopening a wizard cannot reuse an old probe generation", async () => {
+  const h = consoleHarness(); const d = deferred(); h.context.fetch = () => d.promise;
+  const preset = h.presets.find((p)=>p.id==="github");
+  Object.assign(h.wiz, {preset,variant:"cloud",values:{},probe:0,step:"token"});
+  h.node("#wiz").showModal(); h.node("#wiz-secret").value="old fake token";
+  h.node('input[name="wiz-src"]:checked').value="paste";
+  const pending = h.context.testToken(h.node("#wiz-test"));
+  h.node("#wiz").close(); h.context.openWizard();
+  Object.assign(h.wiz, {preset,variant:"cloud",values:{},step:"token"}); h.context.enterToken();
+  h.node("#wiz-secret").value="new fake token";
+  d.resolve(response({ok:true,message:"connection works",status:200})); await pending;
+  assert.equal(h.wiz.tested, null);
+  assert.equal(h.node("#wiz-test-result").textContent, "");
+});
+
+test("cancelling a token probe aborts its fetch and releases its button", async () => {
+  const h = consoleHarness(); let signal;
+  h.context.fetch = (_url, options)=>new Promise((_resolve,reject)=> {
+    signal=options.signal;
+    signal.addEventListener("abort",()=>reject(Object.assign(new Error("aborted"),{name:"AbortError"})),{once:true});
+  });
+  Object.assign(h.wiz, {preset:h.presets.find((p)=>p.id==="github"),variant:"cloud",values:{},probe:0,step:"token"});
+  h.node("#wiz").showModal(); h.node("#wiz-secret").value="fake";
+  h.node('input[name="wiz-src"]:checked').value="paste";
+  const pending=h.context.testToken(h.node("#wiz-test"));
+  h.node("#wiz").close();
+  assert.equal(signal.aborted,true);
+  await pending;
+  assert.equal(h.node("#wiz-test").disabled,false);
+});
+
+test("an invalid advertised URL cannot hide a newly issued one-time key", () => {
+  const h = consoleHarness();
+  h.state.data.proxy=true; h.state.data.gateway_url="http://:8787";
+  h.state.data.upstreams=[{name:"jira",base_url:"https://jira.example.com"}];
+  assert.doesNotThrow(()=>h.context.showSecret("hw_fake","jira"));
+  assert.equal(h.node("#secret-dialog").open,true);
+  assert.equal(h.node("#secret-value").textContent,"hw_fake");
+  assert.match(h.node("#secret-snippet").textContent,/Proxy instructions unavailable/);
+});
+
+test("only new manual upstreams send the atomic create-only precondition", async () => {
+  for (const create of [true,false]) {
+    const h=consoleHarness(); const calls=[];
+    const up={name:"jira",base_url:"https://jira.example.com",auth:{type:"none"}};
+    h.state.data.upstreams=create?[]:[up];
+    h.context.openUpstream(create?undefined:up);
+    h.node("#up-name").value=up.name; h.node("#up-url").value=up.base_url; h.node("#up-auth").value="none";
+    h.context.fetch=async(url,options)=>{
+      calls.push([url,options]);
+      return response(url==="/api/state"?{...h.state.data,upstreams:[up]}:up);
+    };
+    await h.node("#up-form").listeners.get("submit")({preventDefault(){}});
+    const put=calls.find(([,options])=>options.method==="PUT");
+    assert.ok(put);
+    assert.equal(put[1].headers["If-None-Match"],create?"*":undefined);
+  }
+});
+
+test("an aborted old probe cannot keep a reopened wizard locked or unlock its new probe", async () => {
+  const h = consoleHarness(); const old = deferred(), current = deferred(); let calls = 0;
+  h.context.fetch = () => (++calls === 1 ? old.promise : current.promise);
+  const preset = h.presets.find((p) => p.id === "github");
+  Object.assign(h.wiz, {preset, variant:"cloud", values:{}, probe:0, step:"token"});
+  h.node("#wiz").showModal(); h.node("#wiz-secret").value = "old fake token";
+  h.node('input[name="wiz-src"]:checked').value = "paste";
+  const oldProbe = h.context.testToken(h.node("#wiz-test"));
+  h.node("#wiz").close(); h.context.openWizard();
+  Object.assign(h.wiz, {preset, variant:"cloud", values:{}, step:"token"}); h.context.enterToken();
+  h.node("#wiz-secret").value = "new fake token";
+  assert.equal(h.node("#wiz-test").disabled, false);
+  const currentProbe = h.context.testToken(h.node("#wiz-test"));
+  assert.equal(calls, 2);
+  old.resolve(response({ok:true, message:"old connection works", status:200})); await oldProbe;
+  assert.equal(h.node("#wiz-test").disabled, true);
+  assert.equal(h.wiz.tested, null);
+  current.resolve(response({ok:true, message:"current connection works", status:200})); await currentProbe;
+  assert.equal(h.node("#wiz-test").disabled, false);
+  assert.equal(h.wiz.tested, true);
+  assert.match(h.node("#wiz-test-result").textContent, /Current connection works/);
+});
+
+test("read-only POST timeouts give safe retry feedback while writes retain uncertain outcomes", async () => {
+  for (const path of ["/probe", "/explain", "/keys"]) {
+    const h = consoleHarness(); let deadline;
+    h.context.setTimeout = (fn) => { deadline = fn; return 1; };
+    h.context.fetch = (_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), {name:"AbortError"})), {once:true});
+    });
+    const pending = h.context.api("POST", path, {}); deadline();
+    await assert.rejects(pending, path === "/keys" ? /may have applied/ : /timed out\. Try again\./);
+  }
+});
+
+test("header names that overlap object properties survive the upstream editor", async () => {
+  const h = consoleHarness(); let sent;
+  h.context.openUpstream(); h.node("#up-name").value = "demo"; h.node("#up-url").value = "https://example.com";
+  h.node("#up-auth").value = "none"; h.node("#up-headers").value = "__proto__: literal-header";
+  h.context.fetch = async (url, options) => {
+    if (options.method === "PUT") sent = JSON.parse(options.body);
+    return response(url === "/api/state" ? h.state.data : {});
+  };
+  await h.node("#up-form").listeners.get("submit")({preventDefault() {}});
+  assert.equal(Object.hasOwn(sent.headers, "__proto__"), true);
+  assert.equal(sent.headers.__proto__, "literal-header");
+});
+
+test("closing a key dialog releases its pending clipboard button without unlocking a newer copy", async () => {
+  const h = consoleHarness(); const old = deferred(), current = deferred(); let calls = 0;
+  h.context.navigator.clipboard = {writeText:() => (++calls === 1 ? old.promise : current.promise)};
+  h.context.showSecret("hw_first_fake", "jira");
+  const oldCopy = h.node("#copy-secret").listeners.get("click")();
+  h.node("#secret-dialog").close(); h.context.showSecret("hw_second_fake", "jira");
+  assert.equal(h.node("#copy-secret").disabled, false);
+  const currentCopy = h.node("#copy-secret").listeners.get("click")();
+  old.resolve(); await oldCopy;
+  assert.equal(h.node("#copy-secret").disabled, true);
+  assert.equal(h.node("#toast").textContent, "");
+  current.resolve(); await currentCopy;
+  assert.equal(h.node("#copy-secret").disabled, false);
+  assert.equal(h.node("#toast").textContent, "Copied");
 });

@@ -103,12 +103,18 @@ without a restart. Light and dark themes follow the system and can be toggled.
 "current user" endpoint and reports only the status; no response body is
 returned to the browser.
 
-Keep the console on localhost or behind your own TLS and access control. The
-admin API is also scriptable with `Authorization: Bearer hwa_…` and the
+Keep the console on localhost or behind your own TLS and access control.
+Configure an HTTPS reverse proxy to send `X-Forwarded-Proto: https` so login and logout
+cookies are marked Secure. Console cookies also use HttpOnly and SameSite=Strict.
+The admin API is also scriptable with `Authorization: Bearer hwa_…` and the
 `X-Hootway-Console: 1` header for writes.
 The admin token grants full gateway configuration control, including selection
 of environment variables and readable credential files. Give it only to trusted
 operators; virtual agent keys cannot access this listener.
+Scripts can create an upstream with `PUT /api/upstreams/<name>` and
+`If-None-Match: *`: an existing name returns `412 precondition_failed` without
+changing that connection. An ordinary PUT creates or replaces it. The console
+uses create-only requests when adding a connection.
 
 ## Configuration
 
@@ -224,6 +230,10 @@ proxy, set `outbound_proxy`:
   parameters such as `..;`) or encoded `/`, `\`, `.`, `;`, `%` or control bytes
   are rejected so the policy and the upstream see the same path. Rejecting
   encoded `%` also blocks nested escapes such as `%252e`.
+- Queries with malformed percent escapes or raw semicolons return
+  `400 bad_query` before forwarding. Encode a literal semicolon as `%3B`.
+  Well-formed query fields are preserved; query auth replaces its credential
+  parameter.
 - Caller `Authorization`, `Cookie`, `Proxy-Authorization`, `X-Hootway-*` and
   `X-Forwarded-*` headers are stripped, together with method/path override
   headers and request trailers; agent-supplied query credentials are overwritten
@@ -273,7 +283,10 @@ exec probe.
 
 `HOOTWAY_CONFIG` sets the default config path, `HOOTWAY_ADMIN_TOKEN` supplies
 the console token and `HOOTWAY_PUBLIC_URL` sets the gateway URL shown in console
-snippets. Exit status is `0` on success, `1` for configuration or runtime
+snippets. It must be an HTTP(S) URL without credentials, query or fragment.
+Wildcard listener addresses use loopback in local examples; set
+`HOOTWAY_PUBLIC_URL` to an address reachable by your sandbox for remote access.
+Exit status is `0` on success, `1` for configuration or runtime
 errors and `2` for usage errors. `SIGINT`/`SIGTERM` stop accepting connections
 and let in-flight requests, including intercepted HTTPS requests, finish for
 up to 15 seconds; a second signal stops immediately. Idle proxy tunnels and
@@ -281,7 +294,7 @@ connection pools are closed during shutdown.
 
 ## Performance & footprint
 
-Local v0.4.2 builds with Go 1.27.2 (`-s -w -trimpath`, standard library only;
+Local v0.4.3 builds with Go 1.27.2 (`-s -w -trimpath`, standard library only;
 decimal MB). Published sizes can differ with the release toolchain:
 
 | Target | Binary | gzip -9 |
@@ -294,7 +307,7 @@ decimal MB). Published sizes can differ with the release toolchain:
 
 The container image (`scratch` + CA bundle, linux/amd64, Go 1.26.6) is about
 8.0 MB uncompressed. The four console assets are embedded precompressed
-(about 25.5 KB total on the wire) and revalidated with ETags.
+(about 26.2 KB total on the wire) and revalidated with ETags.
 
 Historical v0.2.0 gateway measurements on an Apple M4 Max (`go test -bench`,
 loopback upstream included): a forwarded request took about 37 µs and 8 KiB
