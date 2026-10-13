@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"regexp"
@@ -115,6 +116,9 @@ func LoadConfig(path string) (*Config, error) {
 
 // ParseConfig parses and validates JSON configuration bytes.
 func ParseConfig(data []byte) (*Config, error) {
+	if err := checkJSONObject(data); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	var cfg Config
@@ -124,10 +128,73 @@ func ParseConfig(data []byte) (*Config, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	if dec.More() {
-		return nil, errors.New("parse config: trailing data")
-	}
 	return &cfg, nil
+}
+
+// checkJSONObject rejects multiple values, non-object roots and duplicate
+// names, including the case aliases accepted by encoding/json for structs.
+// Keep errors independent of input values: admin bodies can contain secrets.
+func checkJSONObject(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	token, err := dec.Token()
+	if err != nil || token != json.Delim('{') {
+		return errors.New("expected one JSON object")
+	}
+	if err := checkJSONMembers(dec, '{', 0); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return errors.New("unexpected trailing JSON data")
+	}
+	return nil
+}
+
+func checkJSONMembers(dec *json.Decoder, opening json.Delim, depth int) error {
+	if depth >= 100 {
+		return errors.New("JSON nesting is too deep")
+	}
+	var names map[string]bool
+	if opening == '{' {
+		names = map[string]bool{}
+	}
+	for dec.More() {
+		if names != nil {
+			token, err := dec.Token()
+			name, ok := token.(string)
+			if err != nil || !ok {
+				return errors.New("invalid JSON object")
+			}
+			// Every schema field and HTTP header name is ASCII. Reject other
+			// object keys rather than accepting Unicode case aliases of fields.
+			for i := 0; i < len(name); i++ {
+				if name[i] >= 0x80 {
+					return errors.New("JSON object fields must use ASCII names")
+				}
+			}
+			name = strings.ToLower(name)
+			if names[name] {
+				return errors.New("duplicate JSON object field")
+			}
+			names[name] = true
+		}
+		token, err := dec.Token()
+		if err != nil {
+			return errors.New("invalid JSON value")
+		}
+		if delim, ok := token.(json.Delim); ok {
+			if delim != '{' && delim != '[' {
+				return errors.New("invalid JSON value")
+			}
+			if err := checkJSONMembers(dec, delim, depth+1); err != nil {
+				return err
+			}
+		}
+	}
+	closing, err := dec.Token()
+	if err != nil || opening == '{' && closing != json.Delim('}') || opening == '[' && closing != json.Delim(']') {
+		return errors.New("invalid JSON container")
+	}
+	return nil
 }
 
 // clone returns a validated deep copy of the configuration.
@@ -177,12 +244,15 @@ func (c *Config) validate() error {
 		}
 		upstreams[u.Name] = true
 		base, err := url.Parse(u.BaseURL)
-		if err != nil || (base.Scheme != "https" && base.Scheme != "http") || base.Host == "" {
+		if err != nil || (base.Scheme != "https" && base.Scheme != "http") || base.Hostname() == "" {
 			errs = append(errs, fmt.Errorf("upstream %q: base_url must be an absolute http(s) URL", u.Name))
-		} else if base.RawQuery != "" || base.Fragment != "" || base.User != nil {
+		} else if base.RawQuery != "" || base.ForceQuery || strings.Contains(u.BaseURL, "#") || base.User != nil {
 			errs = append(errs, fmt.Errorf("upstream %q: base_url must not contain query, fragment or userinfo", u.Name))
+		} else if base.Path != "" && checkPath(base.EscapedPath()) != nil {
+			errs = append(errs, fmt.Errorf("upstream %q: base_url contains an unsafe path", u.Name))
 		} else {
 			base.Path = strings.TrimRight(base.Path, "/")
+			base.RawPath = strings.TrimRight(base.RawPath, "/")
 			u.base = base
 		}
 		if err := u.Auth.validate(); err != nil {
@@ -200,8 +270,8 @@ func (c *Config) validate() error {
 				errs = append(errs, fmt.Errorf("upstream %q: %w", u.Name, err))
 			}
 		}
-		if u.TimeoutSeconds < 0 {
-			errs = append(errs, fmt.Errorf("upstream %q: timeout_seconds must be positive", u.Name))
+		if u.TimeoutSeconds < 0 || int64(u.TimeoutSeconds) > (1<<63-1)/int64(time.Second) {
+			errs = append(errs, fmt.Errorf("upstream %q: timeout_seconds must be nonnegative and fit a time.Duration", u.Name))
 		}
 	}
 	keyIDs := map[string]bool{}
@@ -235,8 +305,8 @@ func (c *Config) validate() error {
 				errs = append(errs, fmt.Errorf("key %q: grant for %q needs methods and paths", k.ID, g.Upstream))
 			}
 			for _, m := range g.Methods {
-				if m != "*" && m != strings.ToUpper(m) {
-					errs = append(errs, fmt.Errorf("key %q: method %q must be uppercase or *", k.ID, m))
+				if !validHeaderName(m) || m != strings.ToUpper(m) {
+					errs = append(errs, fmt.Errorf("key %q: method %q must be an uppercase HTTP token or *", k.ID, m))
 				}
 			}
 			for _, p := range g.Paths {
@@ -285,6 +355,9 @@ func (a Auth) validate() error {
 func validatePattern(p string) error {
 	if !strings.HasPrefix(p, "/") {
 		return errors.New("must start with /")
+	}
+	if checkPath(p) != nil || strings.ContainsAny(p, "?#") {
+		return errors.New("must be a safe escaped path without query or fragment")
 	}
 	segs := strings.Split(strings.TrimPrefix(p, "/"), "/")
 	for i, s := range segs {

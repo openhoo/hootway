@@ -10,7 +10,7 @@ var errUnsafePath = errors.New("unsafe request path")
 // splitRoute splits an escaped request path into the upstream name and the
 // upstream-relative path. It rejects encodings that could make the path seen
 // by the policy differ from the path interpreted by the upstream: encoded
-// slashes, backslashes, dots and NUL bytes (in any case), raw backslashes,
+// slashes, backslashes, dots, percent signs and control bytes (in any case), raw backslashes,
 // empty segments ("//") and "." or ".." segments. It does not allocate.
 func splitRoute(escaped string) (name, rest string, err error) {
 	if !strings.HasPrefix(escaped, "/") || hasUnsafeEncoding(escaped) {
@@ -51,9 +51,8 @@ func hasDotSegment(p string) bool {
 	}
 }
 
-// hasUnsafeEncoding reports whether p contains %2f, %5c, %2e, %3b or %00 in
-// any letter case, a backslash, a semicolon (servlet path parameters such as
-// "..;") or an empty segment.
+// hasUnsafeEncoding rejects separators, percent signs (which enable nested
+// decoding), control bytes, servlet path parameters and empty segments.
 func hasUnsafeEncoding(p string) bool {
 	for i := 0; i < len(p); i++ {
 		switch p[i] {
@@ -66,7 +65,8 @@ func hasUnsafeEncoding(p string) bool {
 		case '%':
 			if i+2 < len(p) {
 				hi, lo := p[i+1], p[i+2]|0x20 // lower-case letters only
-				if (hi == '2' && (lo == 'f' || lo == 'e')) || (hi == '5' && lo == 'c') || (hi == '3' && lo == 'b') || (hi == '0' && p[i+2] == '0') {
+				if (hi == '2' && (lo == 'f' || lo == 'e' || lo == '5')) || (hi == '5' && lo == 'c') || (hi == '3' && lo == 'b') ||
+					(hi == '0' || hi == '1') || (hi == '7' && lo == 'f') {
 					return true
 				}
 			}

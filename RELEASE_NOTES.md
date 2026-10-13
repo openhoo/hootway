@@ -1,5 +1,34 @@
 Hootway lets agent sandboxes call logged-in APIs such as Jira with scoped virtual keys instead of real credentials.
 
+## Changes in 0.4.2
+
+### Credential and policy boundary
+
+- Reject nested percent escapes and encoded control bytes before forwarding; validate configured base paths and grants with the same rules
+- Strip caller method/path override headers and request trailers; preserve the exact escaped path when an upstream has an encoded base path
+- Remove credential/cookie headers and echoed credentials from informational responses, final headers and trailers, including encoded forms; omit raw upstream transport/body-copy errors from logs
+- Absolute-form requests require enabled proxy mode, and Check reports the same decision; disabling proxy mode also stops requests in existing tunnels
+- Drain intercepted HTTPS requests during shutdown, close idle tunnels and enforce the shutdown deadline; cap simultaneous intercepted tunnels at 256, reject tunnels without a matching upstream grant, and retire obsolete outbound connection pools after configuration changes
+
+### Admin and secret storage
+
+- Require one JSON object with unique field names; reject ambiguous, trailing and oversized admin requests without reflecting credentials in parsing errors
+- Reject invalid method tokens, unsafe base URLs and duration overflow; reject mismatched key update IDs and ambiguous credential probes
+- Preserve shared upstream/proxy secret files and manually managed credentials during cleanup; reject symlink custody directories and enforce private directory permissions
+- Bound file/environment credentials to 8 KiB, reject device and FIFO sources without blocking, and preserve operator-selected files and mounted-secret aliases
+- Preserve escaped probe paths, report upstream 403 results accurately, and replace partial stored-key hashes with separate display fingerprints
+- Correct gzip quality negotiation and ETag matching
+
+### Console and packaging
+
+- Ignore stale responses after logout, refresh or activity navigation; clear hidden token/key fields when dialogs close and prevent changes while mutations are pending
+- Keep edited grants when navigating Back, retain a saved connection after key-creation failure, and compare connection credential/header semantics before reuse
+- Validate quotas/timeouts as whole numbers, quote shell snippets safely, preserve unchanged expiry timestamps, improve activity errors and fix mobile rule controls
+- Correct Bitbucket API-token scope instructions and refresh desktop/mobile screenshots
+- Add 14 console regressions to CI and release verification, plus focused Go security, admin, CLI and shutdown regressions
+- Pass console test values directly to app functions instead of constructing executable test strings
+- Reject extra CLI arguments, oversized stdin keys and CA lifetime overflow; require an empty release output directory and resolve relative output paths consistently
+
 ## Changes in 0.4.1
 
 - Activity announces proxied requests as "via proxy" to screen readers instead of reading the arrow glyph

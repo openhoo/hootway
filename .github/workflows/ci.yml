@@ -33,6 +33,11 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: Vet
         run: go vet ./...
+      - name: Console regressions
+        run: |
+          node --check internal/gateway/web/app.js
+          node --check internal/gateway/web/presets.js
+          node --test scripts/console.test.mjs
       - name: Test
         run: go test -race -cover ./...
       - name: Benchmark smoke

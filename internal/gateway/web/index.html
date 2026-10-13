@@ -84,6 +84,7 @@
           </select>
         </label>
       </div>
+      <p id="activity-error" class="error" role="status" hidden></p>
       <div id="activity" class="log"></div>
     </section>
 
@@ -98,7 +99,7 @@
         <label class="field"><span>Key</span><select id="check-key" required></select></label>
         <div class="row">
           <label class="field method"><span>Method</span>
-            <select id="check-method"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select>
+            <select id="check-method"><option>GET</option><option>HEAD</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option><option>OPTIONS</option></select>
           </label>
           <label class="field grow"><span>Path</span><input id="check-path" placeholder="/jira/rest/api/3/issue/ABC-1" spellcheck="false" required></label>
         </div>
@@ -240,7 +241,7 @@
     <h3 id="up-title">New upstream</h3>
     <div class="row">
       <label class="field grow"><span>Name</span><input id="up-name" placeholder="jira" spellcheck="false" required><small class="quiet">Agents call <code>/name/…</code></small></label>
-      <label class="field grow"><span>Timeout seconds</span><input id="up-timeout" type="number" min="0" value="60"></label>
+      <label class="field grow"><span>Timeout seconds</span><input id="up-timeout" type="number" min="0" step="1" value="60" inputmode="numeric"><small class="quiet">0 uses the 60-second default.</small></label>
     </div>
     <label class="field"><span>Base URL</span><input id="up-url" type="url" placeholder="https://your-site.atlassian.net" spellcheck="false" required></label>
     <label class="field"><span>Description <em>optional</em></span><input id="up-desc"></label>

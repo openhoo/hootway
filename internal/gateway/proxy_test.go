@@ -157,7 +157,7 @@ func TestProxyModeOffKeepsGatewayBehaviour(t *testing.T) {
 	gw := httptest.NewServer(g)
 	defer gw.Close()
 	c := proxyClient(t, gw.URL, agentKey, "")
-	if code, _ := get(t, c, "GET", up.URL+"/jira/rest/api/3/issue/A-1", nil); code != 401 || got.path != "" {
+	if code, _ := get(t, c, "GET", up.URL+"/jira/rest/api/3/issue/A-1", nil); code != 405 || got.path != "" {
 		t.Fatalf("absolute-form request without proxy mode: %d %q", code, got.path)
 	}
 	req, _ := http.NewRequest(http.MethodConnect, gw.URL, nil)
@@ -272,7 +272,7 @@ func TestHTTPSProxyWithoutCAIsRefused(t *testing.T) {
 }
 
 func TestExplainAcceptsRealUpstreamURLs(t *testing.T) {
-	g, _ := testGateway(t, "https://jira.example.com", nil)
+	g, _ := testGateway(t, "https://jira.example.com", func(c *Config) { c.Proxy = &ProxyMode{} })
 	if d := g.Explain("agent", "GET", "https://jira.example.com/jira/rest/api/3/issue/A-1"); !d.Allowed {
 		t.Fatalf("allowed URL: %+v", d)
 	}

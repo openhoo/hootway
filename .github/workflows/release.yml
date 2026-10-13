@@ -47,6 +47,9 @@ jobs:
           test -z "$(gofmt -l .)"
           go vet ./...
           go test -race ./...
+          node --check internal/gateway/web/app.js
+          node --check internal/gateway/web/presets.js
+          node --test scripts/console.test.mjs
       - name: Build archives
         env:
           VERSION: ${{ steps.v.outputs.version }}

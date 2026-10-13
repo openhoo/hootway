@@ -121,9 +121,12 @@ func (a *webAsset) serve(w http.ResponseWriter, r *http.Request) {
 	h.Set("Cache-Control", "no-cache")
 	h.Set("ETag", a.etag)
 	h.Set("Vary", "Accept-Encoding")
-	if inm := r.Header.Get("If-None-Match"); inm != "" && (inm == a.etag || strings.Contains(inm, a.etag)) {
-		w.WriteHeader(http.StatusNotModified)
-		return
+	for _, tag := range strings.Split(r.Header.Get("If-None-Match"), ",") {
+		tag = strings.TrimSpace(tag)
+		if tag == "*" || strings.TrimPrefix(tag, "W/") == a.etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 	}
 	body := a.raw
 	if a.gz != nil && acceptsGzip(r.Header.Get("Accept-Encoding")) {
@@ -137,13 +140,31 @@ func (a *webAsset) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func acceptsGzip(ae string) bool {
+	wildcard := false
 	for _, part := range strings.Split(ae, ",") {
-		name, q, _ := strings.Cut(strings.TrimSpace(part), ";")
-		if strings.EqualFold(strings.TrimSpace(name), "gzip") {
-			return strings.ReplaceAll(strings.TrimSpace(q), " ", "") != "q=0"
+		fields := strings.Split(part, ";")
+		name := strings.TrimSpace(fields[0])
+		if !strings.EqualFold(name, "gzip") && name != "*" {
+			continue
 		}
+		quality := 1.0
+		for _, field := range fields[1:] {
+			key, value, ok := strings.Cut(strings.TrimSpace(field), "=")
+			if !ok || !strings.EqualFold(strings.TrimSpace(key), "q") {
+				continue
+			}
+			q, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+			if err != nil || q < 0 || q > 1 {
+				q = 0
+			}
+			quality = q
+		}
+		if strings.EqualFold(name, "gzip") {
+			return quality > 0
+		}
+		wildcard = quality > 0
 	}
-	return false
+	return wildcard
 }
 
 func (a *AdminServer) api(w http.ResponseWriter, r *http.Request) {
@@ -268,6 +289,7 @@ func (a *AdminServer) createKey(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
+	in.ID = strings.TrimSpace(in.ID)
 	key, hash, err := GenerateKey()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "could not generate a key")
@@ -277,7 +299,7 @@ func (a *AdminServer) createKey(w http.ResponseWriter, r *http.Request) {
 		if keyIndex(c, in.ID) >= 0 {
 			return nil, errors.New("a key with this id already exists")
 		}
-		k := Key{ID: strings.TrimSpace(in.ID), SHA256: hash}
+		k := Key{ID: in.ID, SHA256: hash}
 		in.apply(&k)
 		c.Keys = append(c.Keys, k)
 		return map[string]string{"id": k.ID, "key": key}, nil
@@ -287,6 +309,10 @@ func (a *AdminServer) createKey(w http.ResponseWriter, r *http.Request) {
 func (a *AdminServer) updateKey(w http.ResponseWriter, r *http.Request, id string) {
 	var in keyInput
 	if !decode(w, r, &in) {
+		return
+	}
+	if in.ID != "" && in.ID != id {
+		writeError(w, http.StatusUnprocessableEntity, "invalid", "the body id must match the URL; renaming a key is not supported")
 		return
 	}
 	a.mutate(w, func(c *Config) (any, error) {
@@ -403,7 +429,7 @@ func (a *AdminServer) state() any {
 	for _, k := range cfg.Keys {
 		keys = append(keys, stateKey{ID: k.ID, Description: k.Description, ExpiresAt: k.ExpiresAt, Disabled: k.Disabled,
 			Expired: k.ExpiresAt != nil && !now.Before(*k.ExpiresAt), RequestsPerMinute: k.RequestsPerMinute,
-			Grants: k.Grants, Fingerprint: k.SHA256[:8], Stats: stats[k.ID]})
+			Grants: k.Grants, Fingerprint: HashKey("hootway key fingerprint:" + k.SHA256)[:8], Stats: stats[k.ID]})
 	}
 	ups := make([]stateUpstream, 0, len(cfg.Upstreams))
 	for _, u := range cfg.Upstreams {
@@ -480,7 +506,7 @@ func (a *AdminServer) authenticated(r *http.Request) bool {
 	a.sessMu.Lock()
 	defer a.sessMu.Unlock()
 	exp, ok := a.sessions[HashKey(c.Value)]
-	if ok && time.Now().After(exp) {
+	if ok && !time.Now().Before(exp) {
 		delete(a.sessions, HashKey(c.Value))
 		return false
 	}
@@ -506,10 +532,25 @@ func upstreamIndex(c *Config, name string) int {
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		if _, oversized := err.(*http.MaxBytesError); oversized {
+			writeError(w, http.StatusRequestEntityTooLarge, "body_too_large", "request body must be at most 1 MiB")
+		} else {
+			writeError(w, http.StatusBadRequest, "bad_json", "could not read the request body")
+		}
+		return false
+	}
+	if err := checkJSONObject(data); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_json", "request body is not valid JSON: "+err.Error())
+		return false
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_json", "request body is not valid JSON: "+err.Error())
+		// Decoder errors can contain an unknown field name or other input.
+		// Never reflect body text: the console accepts pasted credentials.
+		writeError(w, http.StatusBadRequest, "bad_json", "request body has unknown fields or invalid field types")
 		return false
 	}
 	return true
