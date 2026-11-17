@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -72,7 +73,7 @@ func TestServeReportsBindFailureAndReleasesEarlierListeners(t *testing.T) {
 	}
 	defer busy.Close()
 	servers := []*http.Server{newServer(addr, http.NotFoundHandler()), newServer(busy.Addr().String(), http.NotFoundHandler())}
-	if err := serve(context.Background(), servers, slog.New(slog.NewTextHandler(io.Discard, nil))); err == nil {
+	if err := serve(context.Background(), servers, slog.New(slog.NewTextHandler(io.Discard, nil)), nil); err == nil {
 		t.Fatal("second listener bind must fail")
 	}
 	check, err := net.Listen("tcp", addr)
@@ -87,7 +88,7 @@ func TestServeDrainsOnCancellation(t *testing.T) {
 	defer cancel()
 	srv := newServer("127.0.0.1:0", http.NotFoundHandler())
 	done := make(chan error, 1)
-	go func() { done <- serve(ctx, []*http.Server{srv}, slog.New(slog.NewTextHandler(io.Discard, nil))) }()
+	go func() { done <- serve(ctx, []*http.Server{srv}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil) }()
 	cancel()
 	select {
 	case err := <-done:
@@ -96,6 +97,119 @@ func TestServeDrainsOnCancellation(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("cancelled server did not shut down")
+	}
+}
+
+func TestCheckValidatesEffectiveListenerSettingsWithoutBinding(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"admin":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, token, public string
+		flags               []string
+		valid               bool
+	}{
+		{"unbound check", "fixture", "", []string{"-listen", occupied.Addr().String()}, true},
+		{"both dynamic ports", "fixture", "", []string{"-listen", "127.0.0.1:0", "-admin-listen", "127.0.0.1:0"}, true},
+		{"missing admin token", "", "", nil, false},
+		{"same listeners", "fixture", "", []string{"-admin-listen", "127.0.0.1:8787"}, false},
+		{"invalid public URL", "fixture", "not-an-http-url", nil, false},
+		{"invalid gateway port", "fixture", "https://gateway.example", []string{"-listen", "localhost:70000"}, false},
+		{"invalid admin listener", "fixture", "", []string{"-admin-listen", "missing-port"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOOTWAY_ADMIN_TOKEN", tc.token)
+			t.Setenv("HOOTWAY_PUBLIC_URL", tc.public)
+			var out bytes.Buffer
+			err := run(append([]string{"check", "-config", path}, tc.flags...), nil, &out, io.Discard)
+			if (err == nil) != tc.valid || strings.Contains(out.String(), "configuration ok") != tc.valid {
+				t.Fatalf("check: err=%v stdout=%q", err, &out)
+			}
+		})
+	}
+}
+
+func TestConsoleAdvertisesBoundGatewayOrExplicitPublicURL(t *testing.T) {
+	for _, tc := range []struct{ name, public string }{
+		{"assigned port", ""}, {"explicit URL", "https://gateway.example.test/api"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const token = "local-listener-test"
+			t.Setenv("HOOTWAY_ADMIN_TOKEN", token)
+			t.Setenv("HOOTWAY_PUBLIC_URL", tc.public)
+			cfg, err := gateway.ParseConfig([]byte(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			settings, err := effectiveListeners(cfg, "127.0.0.1:0", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			gw, err := gateway.New(cfg, gateway.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(gw.Close)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			logs, sink := net.Pipe()
+			done := make(chan error, 1)
+			go func() {
+				done <- serveGateway(ctx, gw, "", settings, slog.New(slog.NewJSONHandler(sink, nil)))
+				sink.Close()
+			}()
+			t.Cleanup(func() {
+				logs.Close()
+				cancel()
+				if err := <-done; err != nil {
+					t.Error(err)
+				}
+			})
+			deadline, _ := ctx.Deadline()
+			logs.SetReadDeadline(deadline)
+			dec := json.NewDecoder(logs)
+			addrs := map[string]string{}
+			for len(addrs) < 2 {
+				var line struct{ Msg, Addr string }
+				if err := dec.Decode(&line); err != nil {
+					t.Fatal(err)
+				}
+				if line.Addr != "" {
+					addrs[line.Msg] = "http://" + line.Addr
+				}
+			}
+			gatewayURL, adminURL := addrs["hootway listening"], addrs["web console enabled"]
+			req, err := http.NewRequestWithContext(ctx, "GET", adminURL+"/api/state", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			client := &http.Client{Transport: &http.Transport{}}
+			t.Cleanup(client.CloseIdleConnections)
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			var state struct {
+				GatewayURL string `json:"gateway_url"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&state); err != nil || resp.StatusCode != 200 {
+				t.Fatalf("reading console state: HTTP %d, err %v", resp.StatusCode, err)
+			}
+			want := tc.public
+			if want == "" {
+				want = gatewayURL
+			}
+			if state.GatewayURL != want || gatewayURL == adminURL || gatewayURL == "" {
+				t.Fatalf("console advertised %q, want %q on a separate listener", state.GatewayURL, want)
+			}
+		})
 	}
 }
 
@@ -124,7 +238,7 @@ func TestServeWaitsForHandlerConnectionsToDrain(t *testing.T) {
 	h := &drainingHandler{started: make(chan struct{}), release: make(chan struct{})}
 	done := make(chan error, 1)
 	go func() {
-		done <- serve(ctx, []*http.Server{newServer("127.0.0.1:0", h)}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		done <- serve(ctx, []*http.Server{newServer("127.0.0.1:0", h)}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	}()
 	cancel()
 	select {

@@ -130,7 +130,10 @@ $("#login-form").addEventListener("submit", async (e) => {
     } catch (err) { setError("#login-error", err.message); $("#login-token").select(); }
   });
 });
-$("#logout").addEventListener("click", () => busy($("#logout"), async () => { await api("DELETE", "/session").catch(() => {}); showLogin(); }));
+$("#logout").addEventListener("click", () => busy($("#logout"), async () => {
+  try { await api("DELETE", "/session"); showLogin(); }
+  catch { toast("Sign-out was not confirmed. Try to sign out again."); }
+}));
 
 // routing
 const tabs = ["keys", "upstreams", "activity", "check"];
@@ -349,7 +352,7 @@ $("#key-form").addEventListener("submit", async (e) => {
   await busy($("#key-save"), async () => {
     try {
       if (state.editingKey) {
-        await api("PUT", "/keys/" + encodeURIComponent(state.editingKey.id), body);
+        await editItem(state.editingKey, "PUT", "/keys/" + encodeURIComponent(state.editingKey.id), body);
         $("#key-dialog").close(); toast("Key saved");
       } else {
         const res = await api("POST", "/keys", body);
@@ -407,25 +410,31 @@ $("#copy-secret").addEventListener("click", () => {
 });
 $("#secret-dialog").addEventListener("close", () => { cancelSecretCopy(); $("#secret-value").textContent = ""; $("#secret-snippet").textContent = ""; });
 
+// Use the settings the operator actually reviewed, even if a background
+// refresh has since replaced the item in state.data.
+function editItem(item, method, path, body) {
+  return api(method, path, body, undefined, { "If-Match": '"' + item.revision + '"' });
+}
+
 function keyBody(k, patch) {
   return { id: k.id, description: k.description || "", disabled: k.disabled, expires_at: k.expires_at || null,
     requests_per_minute: k.requests_per_minute, grants: k.grants, ...patch };
 }
 function toggleKey(k, btn) {
   return busy(btn, async () => {
-    try { await api("PUT", "/keys/" + encodeURIComponent(k.id), keyBody(k, { disabled: !k.disabled })); toast(k.disabled ? "Key enabled" : "Key disabled"); await refresh(); }
+    try { await editItem(k, "PUT", "/keys/" + encodeURIComponent(k.id), keyBody(k, { disabled: !k.disabled })); toast(k.disabled ? "Key enabled" : "Key disabled"); await refresh(); }
     catch (err) { toast(err.message); }
   });
 }
 function rotateKey(k) {
   confirmAction(`Rotate ${k.id}?`, "The current key stops working immediately. You will get a new key to give to the agent.", "Rotate", async () => {
-    const res = await api("POST", `/keys/${encodeURIComponent(k.id)}/rotate`);
+    const res = await editItem(k, "POST", `/keys/${encodeURIComponent(k.id)}/rotate`);
     $("#confirm-dialog").close(); showSecret(res.key, k.grants[0]?.upstream); await refresh();
   });
 }
 function deleteKey(k) {
   confirmAction(`Delete ${k.id}?`, "Agents using this key lose access immediately. This cannot be undone.", "Delete", async () => {
-    await api("DELETE", "/keys/" + encodeURIComponent(k.id)); toast("Key deleted"); await refresh();
+    await editItem(k, "DELETE", "/keys/" + encodeURIComponent(k.id)); toast("Key deleted"); await refresh();
   });
 }
 
@@ -452,7 +461,7 @@ function syncEgress() {
   const def = state.data.outbound_proxy;
   $("#up-egress-hint").textContent = mode === "inherit"
     ? `Gateway default: ${def ? def : "HTTP_PROXY / HTTPS_PROXY / NO_PROXY from the gateway environment"}.`
-    : mode === "proxy" ? "http, https, socks5 or socks5h. Proxy credentials go in the config file (username + secret_env/secret_file), not in the URL." : "";
+    : mode === "proxy" ? "Use http, https, socks5 or socks5h. Changing the proxy URL removes its saved credential references. Set credentials in the config file." : "";
 }
 $("#up-egress").addEventListener("change", syncEgress);
 
@@ -512,23 +521,34 @@ $("#up-form").addEventListener("submit", async (e) => {
   if (egress === "direct") body.outbound_proxy = { direct: true };
   if (egress === "proxy") {
     const prev = state.editingUpstream && state.editingUpstream.outbound_proxy;
-    body.outbound_proxy = { ...(prev && !prev.direct ? prev : {}), url: v("#up-proxy-url") };
+    const url = v("#up-proxy-url");
+    body.outbound_proxy = prev?.url === url ? { ...prev } : { url };
   }
   if (secret) body.secret = secret;
-  await busy($("#up-save"), async () => {
-    try {
-      await api("PUT", "/upstreams/" + encodeURIComponent(name), body, undefined, state.editingUpstream ? {} : { "If-None-Match": "*" });
-      $("#up-secret").value = "";
-      $("#up-dialog").close(); await refresh();
-      const now = state.data.upstreams.find((u) => u.name === name);
-      toast(now && now.problem ? "Saved — the credential is not available yet" : "Upstream saved");
-    } catch (err) { setError("#up-error", err.message); }
+  const previous = state.editingUpstream;
+  const save = () => busy($("#up-save"), async () => {
+    const path = "/upstreams/" + encodeURIComponent(name);
+    if (previous) await editItem(previous, "PUT", path, body);
+    else await api("PUT", path, body, undefined, { "If-None-Match": "*" });
+    $("#up-secret").value = "";
+    $("#up-dialog").close(); await refresh();
+    const now = state.data?.upstreams.find((u) => u.name === name);
+    toast(now?.problem ? "Saved — the credential is not available yet" : "Upstream saved");
   });
+  if (!secret && previous && ((auth.secret_env && auth.secret_env === previous.auth.secret_env) ||
+      (auth.secret_file && auth.secret_file === previous.auth.secret_file))) {
+    let from, to;
+    try { from = new URL(previous.base_url).origin; to = new URL(body.base_url).origin; }
+    catch { return setError("#up-error", "Enter an absolute HTTP or HTTPS base URL."); }
+    if (from !== to) return confirmAction("Use the saved credential on another server?",
+      `Hootway will send the credential for ${from} to ${to}.`, "Save connection", save);
+  }
+  try { await save(); } catch (err) { setError("#up-error", err.message); }
 });
 $("#up-delete").addEventListener("click", () => {
   const u = state.editingUpstream;
   confirmAction(`Delete /${u.name}?`, "Keys cannot reach this API afterwards. Remove its access rules from keys first.", "Delete", async () => {
-    await api("DELETE", "/upstreams/" + encodeURIComponent(u.name)); $("#up-dialog").close(); toast("Upstream deleted"); await refresh();
+    await editItem(u, "DELETE", "/upstreams/" + encodeURIComponent(u.name)); $("#up-dialog").close(); toast("Upstream deleted"); await refresh();
   });
 });
 
@@ -568,7 +588,7 @@ $("#activity-filter").addEventListener("change", () => renderEvents());
 const outcomeText = {
   forwarded: "forwarded", forbidden: "not allowed", invalid_key: "invalid key", missing_key: "no key",
   bad_path: "unsafe path", bad_query: "unsafe query", rate_limited: "rate limited", upstream_error: "upstream failed", upstream_unconfigured: "no credential",
-  tunnel: "tunnel opened", not_an_upstream: "unknown upstream", upstream_unreachable: "upstream unreachable", bad_request: "bad request",
+  tunnel: "tunnel opened", not_an_upstream: "unknown upstream", ambiguous_upstream: "ambiguous upstream", upstream_unreachable: "upstream unreachable", bad_request: "bad request",
 };
 function renderEvents() {
   const f = $("#activity-filter").value;
@@ -782,6 +802,8 @@ function renderFields() {
 
 function onWhereInput() {
   resetProbe();
+  $("#wiz-secret").value = ""; // a pasted token belongs to the previous destination/account
+  $("#wiz-env").value = "";
   const previous = wiz.reuse;
   wiz.reuse = existingMatch();
   if (wiz.reuse?.name !== previous?.name) $("#wiz-reuse-box").checked = !wiz.reuse?.problem;

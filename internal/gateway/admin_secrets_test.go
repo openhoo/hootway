@@ -130,3 +130,26 @@ func TestConsoleProbe(t *testing.T) {
 		t.Fatalf("csrf: %d", code)
 	}
 }
+
+func TestProbesLeaveOnlyActiveConnectionPools(t *testing.T) {
+	var seen seen
+	up := newUpstream(t, &seen)
+	c, gw, _ := newConsole(t, up.URL)
+	defer gw.Close()
+	c.call("POST", "/api/session", map[string]string{"token": adminToken}, true)
+	for _, body := range []map[string]any{
+		{"name": "jira", "path": "/status"},
+		{"upstream": Upstream{BaseURL: up.URL, Auth: Auth{Type: "none"}, OutboundProxy: &OutboundProxy{Direct: true}}, "path": "/status"},
+	} {
+		code, res := c.call("POST", "/api/probe", body, true)
+		if code != 200 || res["ok"] != true {
+			t.Fatalf("probe failed: %v", res)
+		}
+		gw.trMu.Lock()
+		count := len(gw.transports)
+		gw.trMu.Unlock()
+		if count != 1 {
+			t.Errorf("one active connection should own one pool after the probe, got %d", count)
+		}
+	}
+}

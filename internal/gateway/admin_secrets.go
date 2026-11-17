@@ -202,6 +202,9 @@ func (a *AdminServer) putUpstream(w http.ResponseWriter, r *http.Request, name s
 	createOnly := strings.TrimSpace(r.Header.Get("If-None-Match")) == "*"
 	a.mutateThen(w, func(c *Config) (any, error) {
 		i := upstreamIndex(c, name)
+		if err := checkRevision(r, c.Upstreams, i); err != nil {
+			return nil, err
+		}
 		if createOnly && i >= 0 {
 			return nil, errPreconditionFailed
 		}
@@ -260,6 +263,7 @@ func (a *AdminServer) probe(w http.ResponseWriter, r *http.Request) {
 	var up Upstream
 	var cred credential
 	var eg egress
+	transport := a.gw.transport
 	switch {
 	case req.Upstream != nil:
 		up = *req.Upstream
@@ -317,6 +321,7 @@ func (a *AdminServer) probe(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		up, cred, eg = rt.up, rt.cred, rt.egress
+		transport = rt.proxy.Transport
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
@@ -330,9 +335,11 @@ func (a *AdminServer) probe(w http.ResponseWriter, r *http.Request) {
 		out.Header.Set(k, v)
 	}
 	cred.apply(out)
-	transport := a.gw.transport
 	if transport == nil {
-		transport = a.gw.sharedTransport(15*time.Second, eg)
+		// A draft has no active route to own its pool or proxy credentials.
+		tr := newTransport(15*time.Second, eg)
+		defer tr.CloseIdleConnections()
+		transport = tr
 	}
 	res, err := transport.RoundTrip(out)
 	if err != nil {

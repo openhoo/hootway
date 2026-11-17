@@ -66,6 +66,89 @@ type secondHeaderHook struct {
 	hook func()
 }
 
+func TestAuditRedactsPresentedCredentialsBeforeAuthentication(t *testing.T) {
+	// Exercise the audit sink independently of which routing or authentication
+	// step finished the request, including a request with multiple key sources.
+	g, _ := testGateway(t, "http://unused.test", nil)
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("X-Hootway-Key", "fixture-inline")
+	req.SetBasicAuth("fixture", "fixture-basic")
+	req.Header.Set("Proxy-Authorization", "Bearer fixture-proxy")
+	basicToken := strings.TrimPrefix(req.Header.Get("Authorization"), "Basic ")
+	req.Header.Add("X-Hootway-Key", "another-inline")
+	req.Header.Add("Authorization", "Bearer another-auth")
+	req.Header.Add("Proxy-Authorization", "Bearer another-proxy")
+	var logs bytes.Buffer
+	g.log = slog.New(slog.NewJSONHandler(&logs, nil))
+	values := []string{"fixture-inline", "fixture-basic", "fixture-proxy", basicToken, "another-inline", "another-auth", "another-proxy"}
+	for _, value := range values {
+		rs := &reqState{ev: Event{Method: "GET", Path: value}, state: g.state.Load(), start: g.now()}
+		g.finish(req, rs)
+	}
+	events := g.events.since(0, 10)
+	if len(events) != len(values) {
+		t.Fatal("missing audit events")
+	}
+	for i, ev := range events {
+		if ev.Path != "[redacted]" || strings.Contains(logs.String(), values[i]) {
+			t.Fatal("credential metadata reached an audit output")
+		}
+	}
+}
+
+func TestRedactedKeyLabelStillCountsAgainstItsKey(t *testing.T) {
+	var got seen
+	up := newUpstream(t, &got)
+	g, _ := testGateway(t, up.URL, nil)
+	rec := do(g, "GET", "/jira/ungranted", "agent", map[string]string{"X-Hootway-Key": agentKey})
+	events := g.events.since(0, 1)
+	stats, _, _ := g.events.snapshot()
+	if rec.Code != 403 || got.method != "" || len(events) != 1 || events[0].Key != "[redacted]" || len(stats) != 1 || stats["agent"].Denied != 1 {
+		t.Error("a denied request must keep its counter on the authenticated key without disclosing the label")
+	}
+}
+
+func TestUnavailableBasicAccountStillProtectsItsResolvedPassword(t *testing.T) {
+	for _, account := range []string{"upstream", "outbound proxy"} {
+		t.Run(account, func(t *testing.T) {
+			var got seen
+			up := newUpstream(t, &got)
+			g, _ := testGateway(t, up.URL, nil)
+			cfg, err := g.Config().clone()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if account == "upstream" {
+				cfg.Upstreams[0].Auth = Auth{Type: "basic", UsernameEnv: "MISSING_USER", SecretEnv: "JIRA_TOKEN"}
+			} else {
+				cfg.Upstreams[0].Auth = Auth{Type: "none"}
+				cfg.Upstreams[0].OutboundProxy = &OutboundProxy{URL: up.URL, UsernameEnv: "MISSING_USER", SecretEnv: "JIRA_TOKEN"}
+			}
+			if err := cfg.validate(); err != nil {
+				t.Fatal(err)
+			}
+			g.Apply(cfg)
+			rec := do(g, "GET", "/jira/rest/api/3/issue/real-secret", agentKey, nil)
+			events := g.events.since(0, 1)
+			if rec.Code != 503 || got.method != "" || len(events) != 1 || events[0].Path != "[redacted]" {
+				t.Error("a missing Basic username must disable the route without disabling password redaction")
+			}
+		})
+	}
+}
+
+func TestCheckDoesNotEchoPrivateInputIntoReasons(t *testing.T) {
+	var got seen
+	up := newUpstream(t, &got)
+	g, _ := testGateway(t, up.URL, nil)
+	for _, path := range []string{"/jira/rest/api/3/issue/private-item", "/jira/private-item", "/private-item/status"} {
+		d := g.Explain("agent", "GET", path)
+		if d.Reason == "" || strings.Contains(d.Reason, "private-item") || got.method != "" {
+			t.Error("Check should explain the policy without contacting the upstream or echoing input values")
+		}
+	}
+}
+
 func (w *secondHeaderHook) WriteHeader(status int) {
 	if w.hook != nil {
 		hook := w.hook

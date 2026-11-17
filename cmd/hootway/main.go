@@ -163,18 +163,12 @@ func serveOrCheck(cmd string, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if *listen != "" {
-		cfg.Listen = *listen
-	}
-	if *adminListen != "" {
-		if cfg.Admin == nil {
-			cfg.Admin = &gateway.Admin{}
-		}
-		cfg.Admin.Listen = *adminListen
+	settings, err := effectiveListeners(cfg, *listen, *adminListen)
+	if err != nil {
+		return err
 	}
 	logger := slog.New(slog.NewJSONHandler(stderr, nil))
-	adminEnabled := cfg.Admin != nil && cmd == "serve"
-	gw, err := gateway.New(cfg, gateway.Options{Logger: logger, Lenient: adminEnabled})
+	gw, err := gateway.New(cfg, gateway.Options{Logger: logger, Lenient: cmd == "serve" && settings.admin != ""})
 	if err != nil {
 		return err
 	}
@@ -183,27 +177,81 @@ func serveOrCheck(cmd string, args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "configuration ok: %d upstreams, %d keys\n", len(cfg.Upstreams), len(cfg.Keys))
 		return nil
 	}
-	servers := []*http.Server{newServer(cfg.Listen, gw)}
-	if adminEnabled {
-		hash := cfg.Admin.TokenSHA256
-		if t := os.Getenv("HOOTWAY_ADMIN_TOKEN"); t != "" {
-			hash = gateway.HashKey(t)
-		}
-		if hash == "" {
-			return errors.New("the web console needs admin.token_sha256 or HOOTWAY_ADMIN_TOKEN (see: hootway admin token)")
-		}
-		if cfg.Admin.Listen == cfg.Listen {
-			return errors.New("admin.listen must differ from listen so agents cannot reach the console")
-		}
-		gwURL, err := advertisedGatewayURL(cfg.Listen, os.Getenv("HOOTWAY_PUBLIC_URL"))
-		if err != nil {
-			return err
-		}
-		servers = append(servers, newServer(cfg.Admin.Listen, gateway.NewAdmin(gw, *path, hash, gwURL)))
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return serve(ctx, servers, logger)
+	return serveGateway(ctx, gw, *path, settings, logger)
+}
+
+func serveGateway(ctx context.Context, gw *gateway.Gateway, path string, settings listenerSettings, logger *slog.Logger) error {
+	servers := []*http.Server{newServer(settings.gateway, gw)}
+	var onBound func(net.Addr) error
+	if settings.admin != "" {
+		admin := newServer(settings.admin, nil)
+		servers = append(servers, admin)
+		onBound = func(addr net.Addr) error {
+			publicURL := settings.publicURL
+			if publicURL == "" {
+				var err error
+				publicURL, err = advertisedGatewayURL(addr.String(), "")
+				if err != nil {
+					return err
+				}
+			}
+			admin.Handler = gateway.NewAdmin(gw, path, settings.tokenHash, publicURL)
+			return nil
+		}
+	}
+	return serve(ctx, servers, logger, onBound)
+}
+
+type listenerSettings struct{ gateway, admin, tokenHash, publicURL string }
+
+// Both check and serve validate the same effective settings. Flags affect
+// this invocation only; console edits persist the original file's listeners.
+func effectiveListeners(cfg *gateway.Config, listen, adminListen string) (listenerSettings, error) {
+	s := listenerSettings{gateway: cfg.Listen}
+	if cfg.Admin != nil {
+		s.admin, s.tokenHash = cfg.Admin.Listen, cfg.Admin.TokenSHA256
+	}
+	if listen != "" {
+		s.gateway = listen
+	}
+	if adminListen != "" {
+		s.admin = adminListen
+	}
+	validate := func(addr string) (string, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil || port == "" {
+			return "", errors.New("must include a host and port")
+		}
+		n, err := net.LookupPort("tcp", port)
+		if err != nil {
+			return "", errors.New("invalid TCP port")
+		}
+		return net.JoinHostPort(host, fmt.Sprint(n)), nil
+	}
+	gwAddr, err := validate(s.gateway)
+	if err != nil {
+		return s, fmt.Errorf("listen: %w", err)
+	}
+	if s.admin == "" {
+		return s, nil
+	}
+	adminAddr, err := validate(s.admin)
+	if err != nil {
+		return s, fmt.Errorf("admin.listen: %w", err)
+	}
+	if adminAddr == gwAddr && !strings.HasSuffix(gwAddr, ":0") {
+		return s, errors.New("admin.listen must differ from listen so agents cannot reach the console")
+	}
+	if t := os.Getenv("HOOTWAY_ADMIN_TOKEN"); t != "" {
+		s.tokenHash = gateway.HashKey(t)
+	}
+	if s.tokenHash == "" {
+		return s, errors.New("the web console needs admin.token_sha256 or HOOTWAY_ADMIN_TOKEN (see: hootway admin token)")
+	}
+	s.publicURL, err = advertisedGatewayURL(gwAddr, os.Getenv("HOOTWAY_PUBLIC_URL"))
+	return s, err
 }
 
 // advertisedGatewayURL turns wildcard bind addresses into usable local examples.
@@ -218,21 +266,19 @@ func advertisedGatewayURL(listen, publicURL string) (string, error) {
 		if err != nil {
 			return "", errors.New("listen has an invalid port for console examples")
 		}
+		if portNumber == 0 {
+			return "", nil // the caller resolves the assigned port after binding
+		}
 		if host == "" || host == "0.0.0.0" {
 			host = "127.0.0.1"
 		} else if host == "::" {
 			host = "::1"
 		}
-		publicURL = "http://" + net.JoinHostPort(host, fmt.Sprintf("%d", portNumber))
+		publicURL = (&url.URL{Scheme: "http", Host: net.JoinHostPort(host, fmt.Sprint(portNumber))}).String()
 	}
 	u, err := url.Parse(publicURL)
-	if err != nil || u.Scheme != "http" && u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(publicURL, "#") {
-		return "", errors.New("HOOTWAY_PUBLIC_URL must be an http(s) URL without credentials, query or fragment")
-	}
-	if port := u.Port(); port != "" {
-		if _, err := net.LookupPort("tcp", port); err != nil {
-			return "", errors.New("HOOTWAY_PUBLIC_URL has an invalid port")
-		}
+	if err != nil || u.Scheme != "http" && u.Scheme != "https" || !gateway.ValidEndpointHost(u) || u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || strings.Contains(publicURL, "#") {
+		return "", errors.New("HOOTWAY_PUBLIC_URL must be an http(s) URL with a valid host and port, without credentials, query or fragment")
 	}
 	return strings.TrimRight(u.String(), "/"), nil
 }
@@ -249,17 +295,20 @@ func newServer(addr string, h http.Handler) *http.Server {
 
 // serve binds every listener before announcing readiness, so address errors
 // surface immediately, then runs until ctx is cancelled or a server fails.
-func serve(ctx context.Context, servers []*http.Server, logger *slog.Logger) error {
+func serve(ctx context.Context, servers []*http.Server, logger *slog.Logger, onBound func(net.Addr) error) error {
 	listeners := make([]net.Listener, 0, len(servers))
 	for _, srv := range servers {
 		ln, err := net.Listen("tcp", srv.Addr)
 		if err != nil {
-			for _, l := range listeners {
-				l.Close()
-			}
 			return err
 		}
+		defer ln.Close() // also closes earlier listeners if the next bind or setup fails
 		listeners = append(listeners, ln)
+	}
+	if onBound != nil {
+		if err := onBound(listeners[0].Addr()); err != nil {
+			return err
+		}
 	}
 	errc := make(chan error, len(servers))
 	for i, srv := range servers {

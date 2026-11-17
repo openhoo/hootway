@@ -36,7 +36,7 @@ func checkQuery(query string) error {
 // slashes, backslashes, dots, percent signs and control bytes (in any case), raw backslashes,
 // empty segments ("//") and "." or ".." segments. It does not allocate.
 func splitRoute(escaped string) (name, rest string, err error) {
-	if !strings.HasPrefix(escaped, "/") || hasUnsafeEncoding(escaped) {
+	if checkPath(escaped) != nil {
 		return "", "", errUnsafePath
 	}
 	trimmed := escaped[1:]
@@ -44,9 +44,6 @@ func splitRoute(escaped string) (name, rest string, err error) {
 		name, rest = trimmed[:i], trimmed[i:]
 	} else {
 		name, rest = trimmed, "/"
-	}
-	if hasDotSegment(rest) {
-		return "", "", errUnsafePath
 	}
 	return name, rest, nil
 }
@@ -78,6 +75,9 @@ func hasDotSegment(p string) bool {
 // decoding), control bytes, servlet path parameters and empty segments.
 func hasUnsafeEncoding(p string) bool {
 	for i := 0; i < len(p); i++ {
+		if p[i] < ' ' || p[i] == 0x7f {
+			return true
+		}
 		switch p[i] {
 		case '\\', ';':
 			return true
@@ -86,13 +86,16 @@ func hasUnsafeEncoding(p string) bool {
 				return true
 			}
 		case '%':
-			if i+2 < len(p) {
-				hi, lo := p[i+1], p[i+2]|0x20 // lower-case letters only
-				if (hi == '2' && (lo == 'f' || lo == 'e' || lo == '5')) || (hi == '5' && lo == 'c') || (hi == '3' && lo == 'b') ||
-					(hi == '0' || hi == '1') || (hi == '7' && lo == 'f') {
-					return true
-				}
+			if i+2 >= len(p) {
+				return true
 			}
+			hi, hiOK := sensitiveHexDigit(p[i+1])
+			lo, loOK := sensitiveHexDigit(p[i+2])
+			b := hi<<4 | lo
+			if !hiOK || !loOK || b < ' ' || b == 0x7f || b == '/' || b == '\\' || b == '.' || b == '%' || b == ';' {
+				return true
+			}
+			i += 2
 		}
 	}
 	return false

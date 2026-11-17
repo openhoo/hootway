@@ -109,6 +109,19 @@ test("sign out rejects late API results and clears all secret fields", async () 
   assert.equal(h.node("#secret-value").textContent, "");
 });
 
+test("a failed sign-out keeps a retry available until the server confirms logout", async () => {
+  const h = consoleHarness();
+  h.node("#app").hidden = false; h.node("#login").hidden = true;
+  h.context.fetch = async () => response({}, 503);
+  await h.node("#logout").listeners.get("click")();
+  assert.equal(h.node("#app").hidden, false);
+  assert.match(h.node("#toast").textContent, /sign out again/i);
+  h.context.fetch = async () => response({ authenticated: false });
+  await h.node("#logout").listeners.get("click")();
+  assert.equal(h.node("#login").hidden, false);
+  assert.equal(h.state.data, null);
+});
+
 test("an older state response cannot replace a later refresh", async () => {
   const h = consoleHarness(); const a = deferred(), b = deferred(); let calls = 0;
   h.context.fetch = () => (++calls === 1 ? a.promise : b.promise);
@@ -203,6 +216,56 @@ test("a probe result cannot approve a token after its inputs have changed", asyn
   d.resolve(response({ok:true,message:"connection works",status:200})); await pending;
   assert.equal(h.wiz.tested, null);
   assert.equal(h.node("#wiz-test-result").textContent, "");
+});
+
+test("changing a wizard destination clears the previous pasted credential", () => {
+  const h = consoleHarness();
+  Object.assign(h.wiz, {preset:h.presets.find((p) => p.id === "gitea"), variant:"self", step:"where", level:"read"});
+  h.node("#wf-url").value = "https://new.example.test";
+  h.node("#wiz-secret").value = "fixture";
+  h.context.onWhereInput();
+  assert.equal(h.node("#wiz-secret").value, "");
+});
+
+test("editing a proxy address does not carry its old credential to a new destination", async () => {
+  const h = consoleHarness();
+  const op = {url:"https://old.example.test", username:"fixture", secret_env:"PROXY_FIXTURE"};
+  const up = {name:"service", base_url:"https://service.example.test", auth:{type:"none"}, outbound_proxy:op, revision:"fixture"};
+  h.state.data.upstreams = [up];
+  const sent = [];
+  h.context.fetch = async (url, options) => {
+    if (options.method === "PUT") sent.push(JSON.parse(options.body).outbound_proxy);
+    return response(url === "/api/state" ? h.state.data : {});
+  };
+  for (const url of [op.url, "https://new.example.test"]) {
+    h.context.openUpstream(up);
+    h.node("#up-proxy-url").value = url;
+    await h.node("#up-form").listeners.get("submit")({preventDefault(){}});
+  }
+  assert.deepEqual(sent, [op, {url:"https://new.example.test"}]);
+});
+
+test("an upstream edit needs confirmation to reuse a saved credential on another origin", async () => {
+  const h = consoleHarness();
+  const up = {name:"service", base_url:"https://old.example.test", auth:{type:"bearer", secret_env:"FIXTURE"}, revision:"original"};
+  h.state.data.upstreams = [up];
+  const writes = [];
+  h.context.fetch = async (url, options) => {
+    if (options.method === "PUT") writes.push(options);
+    return response(url === "/api/state" ? h.state.data : {});
+  };
+  h.context.openUpstream(up);
+  h.node("#up-url").value = "https://new.example.test/path";
+  const submit = () => h.node("#up-form").listeners.get("submit")({preventDefault(){}});
+  await submit();
+  assert.equal(writes.length, 0);
+  assert.equal(h.node("#confirm-dialog").open, true);
+  h.node("#confirm-dialog").fields.get("[data-close]").listeners.get("click")();
+  assert.equal(h.node("#up-dialog").open, true);
+  await submit();
+  await h.node("#confirm-ok").onclick();
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].headers["If-Match"], '"original"');
 });
 
 test("Bitbucket token instructions show current vendor scope names", () => {
@@ -333,9 +396,10 @@ test("an invalid advertised URL cannot hide a newly issued one-time key", () => 
 test("only new manual upstreams send the atomic create-only precondition", async () => {
   for (const create of [true,false]) {
     const h=consoleHarness(); const calls=[];
-    const up={name:"jira",base_url:"https://jira.example.com",auth:{type:"none"}};
+    const up={name:"jira",base_url:"https://jira.example.com",auth:{type:"none"},revision:"revision-at-open"};
     h.state.data.upstreams=create?[]:[up];
     h.context.openUpstream(create?undefined:up);
+    if (!create) h.state.data.upstreams = [{...up, revision:"later-refresh"}];
     h.node("#up-name").value=up.name; h.node("#up-url").value=up.base_url; h.node("#up-auth").value="none";
     h.context.fetch=async(url,options)=>{
       calls.push([url,options]);
@@ -345,6 +409,7 @@ test("only new manual upstreams send the atomic create-only precondition", async
     const put=calls.find(([,options])=>options.method==="PUT");
     assert.ok(put);
     assert.equal(put[1].headers["If-None-Match"],create?"*":undefined);
+    assert.equal(put[1].headers["If-Match"],create?undefined:'"revision-at-open"');
   }
 });
 

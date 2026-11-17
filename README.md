@@ -29,7 +29,7 @@ config change, not a credential rotation.
 ```sh
 hootway key new            # prints a hw_… key and its sha256
 cp examples/jira.json hootway.json
-# put the sha256 into keys[0].sha256 and set your Jira site in base_url
+# set keys[0].sha256, choose a future expires_at, and set your Jira site in base_url
 
 export JIRA_EMAIL=bot@example.com JIRA_API_TOKEN=…   # the real credential stays here
 hootway check -config hootway.json
@@ -82,7 +82,7 @@ Open <http://127.0.0.1:8788> and sign in with the token.
 - **Activity** — the last 1,000 requests with key, method, path and outcome.
   No query strings, bodies or credentials are recorded.
 - **Check** — asks the active policy whether a key may call a method and path,
-  without contacting the upstream.
+  without contacting the upstream. [See an example decision](docs/screenshots/check.png).
 
 Changes are validated, written atomically to the config file and applied
 without a restart. Light and dark themes follow the system and can be toggled.
@@ -115,6 +115,16 @@ Scripts can create an upstream with `PUT /api/upstreams/<name>` and
 `If-None-Match: *`: an existing name returns `412 precondition_failed` without
 changing that connection. An ordinary PUT creates or replaces it. The console
 uses create-only requests when adding a connection.
+For an existing key or upstream, `GET /api/state` returns a `revision`.
+Send it in quotes as `If-Match: "<revision>"` when editing, rotating or
+deleting the item. A stale revision returns `412 precondition_failed` and
+leaves the saved settings and credentials intact. The console sends this
+header automatically; an unrelated edit or new activity does not invalidate it.
+If you see a [stale edit warning](docs/screenshots/stale-policy.png), reload the console
+and review the saved settings before reapplying your changes.
+When an edit changes an upstream's origin, the console asks before sending
+its existing credential to the new origin. Changing the outbound proxy URL
+in the console drops the old proxy's credential references.
 
 ## Configuration
 
@@ -144,6 +154,10 @@ uses create-only requests when adding a connection.
 Path patterns are upstream-relative: `*` matches exactly one segment, a final
 `/**` matches the prefix and everything below it. Configuration is strict:
 unknown fields, unknown upstreams and malformed grants fail `hootway check`.
+Write grant paths in escaped form (for example, `/my%20team/*`). Only the root
+grant `/` may end in a slash. Older versions accepted a grant such as
+`/items/` but it never matched. Remove it if access is unnecessary; use
+`/items` if both `/items` and `/items/` should be allowed.
 The config must contain one JSON object with unique field names. Base paths
 and grants use the same unsafe-path checks as incoming requests.
 Credential values from files or environment variables must be single-line and
@@ -158,7 +172,8 @@ config, agents can keep the **real** upstream URL and use Hootway as their
 HTTP proxy instead; the virtual key is the proxy password:
 
 ```sh
-export HTTPS_PROXY=http://agent:hw_…@hootway.internal:8787 HTTP_PROXY=$HTTPS_PROXY
+export HTTPS_PROXY=http://agent:hw_…@hootway.internal:8787
+export HTTP_PROXY="$HTTPS_PROXY"
 export SSL_CERT_FILE=/etc/hootway-ca.pem          # only for https upstreams
 curl https://your-site.atlassian.net/rest/api/3/issue/ABC-1
 ```
@@ -167,6 +182,10 @@ curl https://your-site.atlassian.net/rest/api/3/issue/ABC-1
   header stripping and credential injection as `/<name>/…` requests. The
   upstream is chosen by origin (scheme, host, port) and the longest matching
   `base_url` path; grants stay upstream-relative.
+  If several connections share that origin and base path, the key must
+  identify one of them. A key with grants for more than one receives
+  `403 ambiguous_upstream`; use the named gateway URL to choose a connection.
+  A grant for a shorter base never overrides a more specific route.
 - Hootway is **not an open proxy**: other hosts get `403 not_an_upstream`,
   and `CONNECT` is refused unless the key is valid and has a grant for an upstream
   at the configured `https` origin. At most 256 intercepted tunnels may be open
@@ -186,7 +205,8 @@ curl https://your-site.atlassian.net/rest/api/3/issue/ABC-1
   Hootway answers each tunnel itself with a short-lived certificate for that
   host only (HTTP/1.1) and rechecks the key on every request in the tunnel, so
   disabling or narrowing a key also applies to open tunnels. Without a CA,
-  `CONNECT` answers `503 proxy_https_unavailable`; plain `http://` upstreams
+  `CONNECT` answers `503 proxy_https_unavailable`; an expired CA gives
+  the same response for new tunnels. Plain `http://` upstreams
   work without one.
 - With proxy mode disabled, absolute-form proxy requests return
   `405 proxy_disabled`. Check reports the same outcome for real upstream URLs;
@@ -232,8 +252,9 @@ proxy, set `outbound_proxy`:
   encoded `%` also blocks nested escapes such as `%252e`.
 - Queries with malformed percent escapes or raw semicolons return
   `400 bad_query` before forwarding. Encode a literal semicolon as `%3B`.
-  Well-formed query fields are preserved; query auth replaces its credential
-  parameter.
+  Query auth replaces only its credential parameter. Other fields keep their
+  order, duplicate values, bare flags and original escaping, including in
+  rewritten redirects.
 - Caller `Authorization`, `Cookie`, `Proxy-Authorization`, `X-Hootway-*` and
   `X-Forwarded-*` headers are stripped, together with method/path override
   headers and request trailers; agent-supplied query credentials are overwritten
@@ -286,6 +307,10 @@ the console token and `HOOTWAY_PUBLIC_URL` sets the gateway URL shown in console
 snippets. It must be an HTTP(S) URL without credentials, query or fragment.
 Wildcard listener addresses use loopback in local examples; set
 `HOOTWAY_PUBLIC_URL` to an address reachable by your sandbox for remote access.
+`check` validates the effective listener and admin settings without binding a
+port. Supply the same environment and listener overrides as for `serve`.
+Listener overrides affect only that run; a console edit does not write them
+into the configuration.
 Exit status is `0` on success, `1` for configuration or runtime
 errors and `2` for usage errors. `SIGINT`/`SIGTERM` stop accepting connections
 and let in-flight requests, including intercepted HTTPS requests, finish for
@@ -294,20 +319,20 @@ connection pools are closed during shutdown.
 
 ## Performance & footprint
 
-Local v0.4.3 builds with Go 1.27.2 (`-s -w -trimpath`, standard library only;
-decimal MB). Published sizes can differ with the release toolchain:
+Release archives and the container use Go 1.27.4. Local builds with the
+release flags (`-s -w -trimpath`, standard library only; decimal MB):
 
 | Target | Binary | gzip -9 |
 | --- | ---: | ---: |
 | linux/amd64 | 8.5 MB | 3.5 MB |
 | linux/arm64 | 7.9 MB | 3.2 MB |
 | darwin/amd64 | 8.7 MB | 3.6 MB |
-| darwin/arm64 | 8.0 MB | 3.3 MB |
+| darwin/arm64 | 8.1 MB | 3.3 MB |
 | windows/amd64 | 8.7 MB | 3.6 MB |
 
-The container image (`scratch` + CA bundle, linux/amd64, Go 1.26.6) is about
-8.0 MB uncompressed. The four console assets are embedded precompressed
-(about 26.2 KB total on the wire) and revalidated with ETags.
+The linux/amd64 container has 8.7 MB of files, including the binary and CA
+bundle, on `scratch`. The four console assets are embedded precompressed
+(26.8 KB total on the wire) and revalidated with ETags.
 
 Historical v0.2.0 gateway measurements on an Apple M4 Max (`go test -bench`,
 loopback upstream included): a forwarded request took about 37 µs and 8 KiB

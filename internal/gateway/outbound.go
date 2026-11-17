@@ -35,8 +35,8 @@ func (p *OutboundProxy) validate() error {
 		return nil
 	}
 	u, err := url.Parse(p.URL)
-	if err != nil || u.Host == "" || u.Hostname() == "" {
-		return errors.New("outbound_proxy: url must be an absolute http, https, socks5 or socks5h URL (or set direct)")
+	if err != nil || !ValidEndpointHost(u) {
+		return errors.New("outbound_proxy: url must be an absolute http, https, socks5 or socks5h URL with a valid host and port (or set direct)")
 	}
 	switch u.Scheme {
 	case "http", "https", "socks5", "socks5h":
@@ -46,7 +46,7 @@ func (p *OutboundProxy) validate() error {
 	if u.User != nil {
 		return errors.New("outbound_proxy: url must not contain credentials; use username and secret_env or secret_file")
 	}
-	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+	if (u.EscapedPath() != "" && u.EscapedPath() != "/") || u.RawQuery != "" || u.ForceQuery || strings.Contains(p.URL, "#") {
 		return errors.New("outbound_proxy: url must not contain a path, query or fragment")
 	}
 	if p.Username != "" && p.UsernameEnv != "" {
@@ -110,24 +110,26 @@ func resolveEgress(up, top *OutboundProxy, getenv func(string) string) (egress, 
 	}
 	u := *p.parsed
 	var secret string
+	if p.SecretEnv != "" || p.SecretFile != "" {
+		var err error
+		secret, err = readSecret(p.SecretEnv, p.SecretFile, getenv)
+		if err != nil {
+			return egress{}, fmt.Errorf("outbound proxy: %w", err)
+		}
+	}
 	user := p.Username
 	if p.UsernameEnv != "" {
 		user = getenv(p.UsernameEnv)
 		if user == "" {
-			return egress{}, fmt.Errorf("outbound proxy: environment variable %s is empty", p.UsernameEnv)
+			return egress{secret: secret}, fmt.Errorf("outbound proxy: environment variable %s is empty", p.UsernameEnv)
 		}
 		if strings.ContainsAny(user, ":\r\n\x00") {
-			return egress{}, fmt.Errorf("outbound proxy: environment variable %s contains a colon or line break", p.UsernameEnv)
+			return egress{secret: secret}, fmt.Errorf("outbound proxy: environment variable %s contains a colon or line break", p.UsernameEnv)
 		}
 	}
 	if user != "" {
-		if p.SecretEnv != "" || p.SecretFile != "" {
-			pass, err := readSecret(p.SecretEnv, p.SecretFile, getenv)
-			if err != nil {
-				return egress{}, fmt.Errorf("outbound proxy: %w", err)
-			}
-			u.User = url.UserPassword(user, pass)
-			secret = pass
+		if secret != "" {
+			u.User = url.UserPassword(user, secret)
 		} else {
 			u.User = url.User(user)
 		}

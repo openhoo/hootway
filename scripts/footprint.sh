@@ -19,5 +19,5 @@ for target in "${targets[@]}"; do
 done
 
 if [[ -n "${IMAGE:-}" ]]; then
-  printf '\nImage %s: %s bytes (uncompressed)\n' "$IMAGE" "$(docker image inspect "$IMAGE" --format '{{.Size}}')"
+  printf '\nImage %s: %s bytes (reported by the Docker image store)\n' "$IMAGE" "$(docker image inspect "$IMAGE" --format '{{.Size}}')"
 fi

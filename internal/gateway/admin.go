@@ -133,12 +133,9 @@ func (a *webAsset) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.Set("ETag", etag)
-	for _, tag := range strings.Split(strings.Join(r.Header.Values("If-None-Match"), ","), ",") {
-		tag = strings.TrimSpace(tag)
-		if tag == "*" || strings.TrimPrefix(tag, "W/") == etag {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
+	if matchesETag(r.Header.Values("If-None-Match"), etag, true) {
+		w.WriteHeader(http.StatusNotModified)
+		return
 	}
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	if r.Method != http.MethodHead {
@@ -147,7 +144,8 @@ func (a *webAsset) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func acceptsGzip(ae string) bool {
-	return encodingQuality(ae, "gzip", 0) > 0
+	gzip := encodingQuality(ae, "gzip", 0)
+	return gzip > 0 && gzip >= encodingQuality(ae, "identity", -1)
 }
 
 // Repeated codings and parameters use their lowest quality, so a later value
@@ -256,11 +254,7 @@ func (a *AdminServer) api(w http.ResponseWriter, r *http.Request) {
 	case len(parts) == 2 && parts[0] == "keys" && r.Method == http.MethodPut:
 		a.updateKey(w, r, parts[1])
 	case len(parts) == 2 && parts[0] == "keys" && r.Method == http.MethodDelete:
-		a.mutate(w, func(c *Config) (any, error) {
-			i := keyIndex(c, parts[1])
-			if i < 0 {
-				return nil, errNotFound
-			}
+		a.mutateKey(w, r, parts[1], func(c *Config, i int) (any, error) {
 			c.Keys = append(c.Keys[:i], c.Keys[i+1:]...)
 			return map[string]string{"deleted": parts[1]}, nil
 		})
@@ -270,11 +264,7 @@ func (a *AdminServer) api(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "internal", "could not generate a key")
 			return
 		}
-		a.mutate(w, func(c *Config) (any, error) {
-			i := keyIndex(c, parts[1])
-			if i < 0 {
-				return nil, errNotFound
-			}
+		a.mutateKey(w, r, parts[1], func(c *Config, i int) (any, error) {
 			c.Keys[i].SHA256 = hash
 			return map[string]string{"id": parts[1], "key": key}, nil
 		})
@@ -284,6 +274,9 @@ func (a *AdminServer) api(w http.ResponseWriter, r *http.Request) {
 		var removed Upstream
 		a.mutateThen(w, func(c *Config) (any, error) {
 			i := upstreamIndex(c, parts[1])
+			if err := checkRevision(r, c.Upstreams, i); err != nil {
+				return nil, err
+			}
 			if i < 0 {
 				return nil, errNotFound
 			}
@@ -355,11 +348,7 @@ func (a *AdminServer) updateKey(w http.ResponseWriter, r *http.Request, id strin
 		writeError(w, http.StatusUnprocessableEntity, "invalid", "the body id must match the URL; renaming a key is not supported")
 		return
 	}
-	a.mutate(w, func(c *Config) (any, error) {
-		i := keyIndex(c, id)
-		if i < 0 {
-			return nil, errNotFound
-		}
+	a.mutateKey(w, r, id, func(c *Config, i int) (any, error) {
 		in.apply(&c.Keys[i])
 		return map[string]string{"id": id}, nil
 	})
@@ -367,6 +356,74 @@ func (a *AdminServer) updateKey(w http.ResponseWriter, r *http.Request, id strin
 
 var errNotFound = errors.New("not found")
 var errPreconditionFailed = errors.New("precondition failed")
+var errStaleRevision = errors.New("stale revision")
+
+// Only persisted settings contribute to a revision. Activity counters,
+// expiry relative to now and credential availability can change independently.
+func revision(item any) string {
+	data, err := json.Marshal(item)
+	if err != nil {
+		return "" // unrepresentable items cannot be conditionally edited
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// Entity tags are quoted; a comma inside a tag is not a list separator.
+func matchesETag(values []string, want string, allowWeak bool) bool {
+	s := strings.TrimSpace(strings.Join(values, ","))
+	if s == "*" {
+		return true
+	}
+	matched := false
+	for s != "" {
+		weak := strings.HasPrefix(s, "W/")
+		s = strings.TrimPrefix(s, "W/")
+		if len(s) == 0 || s[0] != '"' {
+			return false
+		}
+		end := strings.IndexByte(s[1:], '"')
+		if end < 0 {
+			return false
+		}
+		end += 2
+		matched = matched || (allowWeak || !weak) && s[:end] == want
+		s = strings.TrimSpace(s[end:])
+		if s != "" {
+			if s[0] != ',' {
+				return false
+			}
+			s = strings.TrimSpace(s[1:])
+		}
+	}
+	return matched
+}
+
+func checkRevision[T any](r *http.Request, items []T, index int) error {
+	if values := r.Header.Values("If-Match"); len(values) != 0 {
+		if index < 0 {
+			return errStaleRevision
+		}
+		current := revision(items[index])
+		if current == "" || !matchesETag(values, `"`+current+`"`, false) {
+			return errStaleRevision
+		}
+	}
+	return nil
+}
+
+func (a *AdminServer) mutateKey(w http.ResponseWriter, r *http.Request, id string, fn func(*Config, int) (any, error)) {
+	a.mutate(w, func(c *Config) (any, error) {
+		i := keyIndex(c, id)
+		if err := checkRevision(r, c.Keys, i); err != nil {
+			return nil, err
+		}
+		if i < 0 {
+			return nil, errNotFound
+		}
+		return fn(c, i)
+	})
+}
 
 // mutate applies fn to a copy of the configuration, validates it, persists it
 // and only then activates it.
@@ -389,6 +446,10 @@ func (a *AdminServer) mutateThen(w http.ResponseWriter, fn func(*Config) (any, e
 		return
 	}
 	result, err := fn(next)
+	if errors.Is(err, errStaleRevision) {
+		writeError(w, http.StatusPreconditionFailed, "precondition_failed", "this item changed or was removed; reload the console and review the current settings before trying again")
+		return
+	}
 	if errors.Is(err, errPreconditionFailed) {
 		writeError(w, http.StatusPreconditionFailed, "precondition_failed", "an upstream with this name already exists")
 		return
@@ -450,6 +511,7 @@ func (a *AdminServer) persist(c *Config) error {
 
 type stateKey struct {
 	ID                string     `json:"id"`
+	Revision          string     `json:"revision"`
 	Description       string     `json:"description,omitempty"`
 	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
 	Disabled          bool       `json:"disabled"`
@@ -462,7 +524,8 @@ type stateKey struct {
 
 type stateUpstream struct {
 	Upstream
-	Problem string `json:"problem,omitempty"`
+	Problem  string `json:"problem,omitempty"`
+	Revision string `json:"revision"`
 }
 
 func (a *AdminServer) state() any {
@@ -473,13 +536,13 @@ func (a *AdminServer) state() any {
 	now := a.gw.now()
 	keys := make([]stateKey, 0, len(cfg.Keys))
 	for _, k := range cfg.Keys {
-		keys = append(keys, stateKey{ID: k.ID, Description: k.Description, ExpiresAt: k.ExpiresAt, Disabled: k.Disabled,
+		keys = append(keys, stateKey{ID: k.ID, Revision: revision(k), Description: k.Description, ExpiresAt: k.ExpiresAt, Disabled: k.Disabled,
 			Expired: k.ExpiresAt != nil && !now.Before(*k.ExpiresAt), RequestsPerMinute: k.RequestsPerMinute,
 			Grants: k.Grants, Fingerprint: HashKey("hootway key fingerprint:" + k.SHA256)[:8], Stats: stats[k.ID]})
 	}
 	ups := make([]stateUpstream, 0, len(cfg.Upstreams))
 	for _, u := range cfg.Upstreams {
-		ups = append(ups, stateUpstream{Upstream: u, Problem: problems[u.Name]})
+		ups = append(ups, stateUpstream{Upstream: u, Revision: revision(u), Problem: problems[u.Name]})
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i].ID < keys[j].ID })
 	outbound := ""
@@ -491,7 +554,7 @@ func (a *AdminServer) state() any {
 	}
 	return map[string]any{
 		"proxy":          cfg.Proxy != nil,
-		"proxy_https":    st.ca != nil,
+		"proxy_https":    st.ca.validAt(now),
 		"outbound_proxy": outbound,
 		"gateway_url":    a.gatewayURL,
 		"persistent":     a.path != "",
@@ -507,7 +570,7 @@ func (a *AdminServer) login(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if subtle.ConstantTimeCompare([]byte(HashKey(req.Token)), []byte(a.tokenHash)) != 1 {
+	if !a.validToken(req.Token) {
 		time.Sleep(300 * time.Millisecond)
 		writeError(w, http.StatusUnauthorized, "invalid_token", "that admin token is not valid")
 		return
@@ -563,8 +626,8 @@ func secureAdminCookie(r *http.Request) bool {
 }
 
 func (a *AdminServer) authenticated(r *http.Request) bool {
-	if authz := r.Header.Get("Authorization"); strings.HasPrefix(authz, "Bearer ") {
-		return subtle.ConstantTimeCompare([]byte(HashKey(strings.TrimPrefix(authz, "Bearer "))), []byte(a.tokenHash)) == 1
+	if scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " "); ok && strings.EqualFold(scheme, "Bearer") {
+		return a.validToken(strings.TrimSpace(token))
 	}
 	c, err := r.Cookie(sessionCookie)
 	if err != nil {
@@ -578,6 +641,10 @@ func (a *AdminServer) authenticated(r *http.Request) bool {
 		return false
 	}
 	return ok
+}
+
+func (a *AdminServer) validToken(token string) bool {
+	return token != "" && subtle.ConstantTimeCompare([]byte(HashKey(token)), []byte(a.tokenHash)) == 1
 }
 
 func keyIndex(c *Config, id string) int {
