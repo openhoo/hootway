@@ -379,9 +379,9 @@ func newTransport(timeout time.Duration, eg egress) *http.Transport {
 	}
 }
 
-// lookupKey finds the runtime key for a presented virtual key. Keys are
-// indexed by their SHA-256, so lookup time does not depend on how much of a
-// guessed key matches; the final comparison is constant time as well.
+// lookupKey finds the runtime key for a presented virtual key. Basic Auth
+// carries the key in its password field, but generated keys have 256 bits of
+// randomness. The digest indexes the key without storing it in plaintext.
 func (st *runtimeState) lookupKey(presented string) *runtimeKey {
 	sum := sha256.Sum256([]byte(presented))
 	rk := st.keys[sum]

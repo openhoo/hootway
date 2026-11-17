@@ -151,6 +151,11 @@ in the console drops the old proxy's credential references.
 | `keys[].requests_per_minute` | Per-key limit, `0` = unlimited. |
 | `keys[].grants[]` | `upstream`, `methods` (`GET`, … or `*`) and `paths`. |
 
+Generate virtual keys with `hootway key new` or the console. Both use 32 random
+bytes per key. `hootway key hash` is for existing cryptographically random
+keys. Human-chosen passwords are unsafe here because the stored SHA-256 digest
+does not slow down password guessing.
+
 Path patterns are upstream-relative: `*` matches exactly one segment, a final
 `/**` matches the prefix and everything below it. Configuration is strict:
 unknown fields, unknown upstreams and malformed grants fail `hootway check`.
@@ -297,7 +302,7 @@ exec probe.
 | --- | --- |
 | `hootway serve [-config FILE] [-listen ADDR] [-admin-listen ADDR]` | Run the gateway and, if configured, the console. |
 | `hootway check [-config FILE]` | Validate the config and resolve every secret, then exit. |
-| `hootway key new` / `hootway key hash` | Create a virtual key, or hash one read from stdin. |
+| `hootway key new` / `hootway key hash` | Generate a random virtual key, or hash an existing random key read from stdin. |
 | `hootway admin token` | Create a console token and its hash. |
 | `hootway proxy ca [-cert FILE] [-key FILE] [-days N]` | Create a CA for https proxy mode (key `0600`, never overwritten). |
 | `hootway version` | Print version and commit. |
