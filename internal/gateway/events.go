@@ -50,6 +50,10 @@ func newEventLog(n int) *eventLog {
 }
 
 func (l *eventLog) add(e Event) {
+	l.record(e, e.Key)
+}
+
+func (l *eventLog) record(e Event, keyID string) {
 	forwarded := e.Outcome == "forwarded"
 	tunnel := e.Outcome == "tunnel" // an opened CONNECT tunnel is neither
 	l.mu.Lock()
@@ -62,18 +66,20 @@ func (l *eventLog) add(e Event) {
 	case !tunnel:
 		l.total.denied++
 	}
-	if e.Key != "" && !tunnel {
-		s := l.stats[e.Key]
+	if keyID != "" && !tunnel {
+		s := l.stats[keyID]
 		if s == nil {
 			s = &keyStats{}
-			l.stats[e.Key] = s
+			l.stats[keyID] = s
 		}
 		if forwarded {
 			s.forwarded++
 		} else {
 			s.denied++
 		}
-		s.lastUsed = e.Time
+		if e.Time.After(s.lastUsed) {
+			s.lastUsed = e.Time
+		}
 	}
 	l.mu.Unlock()
 }

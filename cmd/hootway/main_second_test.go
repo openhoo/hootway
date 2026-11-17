@@ -47,8 +47,9 @@ func TestAdvertisedGatewayURL(t *testing.T) {
 	for listen, want := range map[string]string{
 		":8787": "http://127.0.0.1:8787", "0.0.0.0:8787": "http://127.0.0.1:8787",
 		"[::]:8787": "http://[::1]:8787", "localhost:8787": "http://localhost:8787",
-		"[::1]:8787":     "http://[::1]:8787",
-		"localhost:http": "http://localhost:80",
+		"[::1]:8787":         "http://[::1]:8787",
+		"localhost:http":     "http://localhost:80",
+		"[fe80::1%en0]:8787": "http://[fe80::1%25en0]:8787",
 	} {
 		got, err := advertisedGatewayURL(listen, "")
 		if err != nil || got != want {

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -217,6 +218,8 @@ func (c *Config) validate() error {
 		}
 		if c.Admin.TokenSHA256 != "" && !hashPattern.MatchString(c.Admin.TokenSHA256) {
 			errs = append(errs, errors.New("admin: token_sha256 must be 64 lowercase hex characters"))
+		} else if c.Admin.TokenSHA256 == HashKey("") {
+			errs = append(errs, errors.New("admin: token_sha256 must not represent an empty token"))
 		}
 	}
 	if c.Proxy != nil && (c.Proxy.CACertFile == "") != (c.Proxy.CAKeyFile == "") {
@@ -244,8 +247,8 @@ func (c *Config) validate() error {
 		}
 		upstreams[u.Name] = true
 		base, err := url.Parse(u.BaseURL)
-		if err != nil || (base.Scheme != "https" && base.Scheme != "http") || base.Hostname() == "" {
-			errs = append(errs, fmt.Errorf("upstream %q: base_url must be an absolute http(s) URL", u.Name))
+		if err != nil || (base.Scheme != "https" && base.Scheme != "http") || !ValidEndpointHost(base) {
+			errs = append(errs, fmt.Errorf("upstream %q: base_url must be an absolute http(s) URL with a valid host and port", u.Name))
 		} else if base.RawQuery != "" || base.ForceQuery || strings.Contains(u.BaseURL, "#") || base.User != nil {
 			errs = append(errs, fmt.Errorf("upstream %q: base_url must not contain query, fragment or userinfo", u.Name))
 		} else if base.Path != "" && checkPath(base.EscapedPath()) != nil {
@@ -286,6 +289,8 @@ func (c *Config) validate() error {
 		keyIDs[k.ID] = true
 		if !hashPattern.MatchString(k.SHA256) {
 			errs = append(errs, fmt.Errorf("key %q: sha256 must be 64 lowercase hex characters", k.ID))
+		} else if k.SHA256 == HashKey("") {
+			errs = append(errs, fmt.Errorf("key %q: sha256 must not represent an empty key", k.ID))
 		}
 		if hashes[k.SHA256] {
 			errs = append(errs, fmt.Errorf("key %q: duplicate sha256", k.ID))
@@ -364,12 +369,30 @@ func validHeaderValue(s string) bool {
 	return true
 }
 
+// ValidEndpointHost verifies the authority of a parsed destination URL
+// without doing DNS or opening a connection.
+func ValidEndpointHost(u *url.URL) bool {
+	host := u.Hostname()
+	if host == "" || strings.HasSuffix(u.Host, ":") || strings.Contains(host, ":") && !strings.HasPrefix(u.Host, "[") {
+		return false
+	}
+	if p := u.Port(); p != "" {
+		n, err := strconv.ParseUint(p, 10, 16)
+		return err == nil && n > 0
+	}
+	return true
+}
+
 func validatePattern(p string) error {
 	if !strings.HasPrefix(p, "/") {
 		return errors.New("must start with /")
 	}
-	if checkPath(p) != nil || strings.ContainsAny(p, "?#") {
+	u, err := url.ParseRequestURI(p)
+	if err != nil || u.EscapedPath() != p || checkPath(p) != nil || strings.ContainsAny(p, "?#") {
 		return errors.New("must be a safe escaped path without query or fragment")
+	}
+	if len(p) > 1 && strings.HasSuffix(p, "/") {
+		return errors.New("omit the trailing slash; the grant already matches requests with or without it")
 	}
 	segs := strings.Split(strings.TrimPrefix(p, "/"), "/")
 	for i, s := range segs {

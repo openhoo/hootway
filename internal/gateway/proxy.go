@@ -9,7 +9,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -31,8 +30,9 @@ import (
 // no opaque traffic ever passes through.
 
 var (
-	errNotUpstream    = encodeError("not_an_upstream", "the proxy only serves the origins of configured upstreams")
-	errProxyTLSOff    = encodeError("proxy_https_unavailable", "https proxying needs proxy.ca_cert_file and proxy.ca_key_file on the gateway")
+	notAnUpstream     = newOriginError("not_an_upstream", "the proxy only serves the origins of configured upstreams")
+	ambiguousUpstream = newOriginError("ambiguous_upstream", "this key grants multiple connections at this URL; use the named gateway path")
+	errProxyTLSOff    = encodeError("proxy_https_unavailable", "https proxying needs a currently valid proxy CA certificate and key on the gateway")
 	errProxyBadTarget = encodeError("bad_target", "the proxy target is not a valid host:port")
 	errProxyDisabled  = encodeError("proxy_disabled", "proxy mode is not enabled on this gateway")
 	errProxyBusy      = encodeError("proxy_busy", "the gateway's intercepted tunnel limit is reached; retry later")
@@ -59,19 +59,49 @@ func orRoot(p string) string {
 	return p
 }
 
-// matchOrigin maps a real upstream URL to the upstream name and the
-// upstream-relative path. The longest matching base path wins.
-func (st *runtimeState) matchOrigin(scheme, host, escapedPath string) (name, rest string, ok bool) {
+type originError struct {
+	decision Decision
+	body     []byte
+}
+
+func newOriginError(code, reason string) *originError {
+	return &originError{Decision{Outcome: code, Reason: reason}, encodeError(code, reason)}
+}
+
+// Choose the longest configured base before considering grants. At that
+// base a URL cannot distinguish two credentials; a key must identify at
+// most one connection. The selected route still enforces method and path.
+func (st *runtimeState) matchOrigin(k *runtimeKey, scheme, host, escapedPath string) (name, rest string, problem *originError) {
 	p := orRoot(escapedPath)
-	for _, rt := range st.origins[originKey(scheme, host)] {
-		if p == rt.escBase || rt.escBase == "" {
-			return rt.up.Name, orRoot(p[len(rt.escBase):]), true
+	routes := st.origins[originKey(scheme, host)]
+	for i, rt := range routes {
+		if p != rt.escBase && !strings.HasPrefix(p, rt.escBase+"/") {
+			continue
 		}
-		if strings.HasPrefix(p, rt.escBase+"/") {
-			return rt.up.Name, p[len(rt.escBase):], true
+		selected := rt
+		for _, other := range routes[i+1:] {
+			if len(other.escBase) < len(rt.escBase) {
+				break
+			}
+			if other.escBase == rt.escBase && k.grantsUpstream(other.up.Name) {
+				if k.grantsUpstream(selected.up.Name) {
+					return "", "", ambiguousUpstream
+				}
+				selected = other
+			}
+		}
+		return selected.up.Name, orRoot(p[len(rt.escBase):]), nil
+	}
+	return "", "", notAnUpstream
+}
+
+func (k *runtimeKey) grantsUpstream(name string) bool {
+	for _, grant := range k.grants {
+		if grant.upstream == name {
+			return true
 		}
 	}
-	return "", "", false
+	return false
 }
 
 // proxyKey extracts a virtual key from Proxy-Authorization: the password of
@@ -85,12 +115,7 @@ func proxyKey(r *http.Request) string {
 	case "bearer":
 		return strings.TrimSpace(token)
 	case "basic":
-		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(token))
-		if err != nil {
-			return ""
-		}
-		_, pass, _ := strings.Cut(string(raw), ":")
-		return pass
+		return basicPassword(strings.TrimSpace(token))
 	}
 	return ""
 }
@@ -157,10 +182,10 @@ func (g *Gateway) serveProxied(rs *reqState, r *http.Request, scheme, host strin
 		writeStaticError(&rs.rec, http.StatusBadRequest, errBadQuery)
 		return
 	}
-	name, rest, ok := st.matchOrigin(scheme, host, path)
-	if !ok {
-		rs.info.outcome = "forbidden"
-		writeStaticError(&rs.rec, http.StatusForbidden, errNotUpstream)
+	name, rest, problem := st.matchOrigin(k, scheme, host, path)
+	if problem != nil {
+		rs.info.outcome = problem.decision.Outcome
+		writeStaticError(&rs.rec, http.StatusForbidden, problem.body)
 		return
 	}
 	g.forward(rs, r, st, k, name, rest)
@@ -193,7 +218,7 @@ func (g *Gateway) serveConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	defer record()
 	if st.cfg.Proxy == nil {
-		rs.info.outcome = "bad_path"
+		rs.info.outcome = "proxy_disabled"
 		writeStaticError(&rs.rec, http.StatusMethodNotAllowed, errProxyDisabled)
 		return
 	}
@@ -213,20 +238,20 @@ func (g *Gateway) serveConnect(w http.ResponseWriter, r *http.Request) {
 	routes := st.origins[originKey("https", r.Host)]
 	granted := false
 	for _, rt := range routes {
-		for _, grant := range k.grants {
-			if grant.upstream == rt.up.Name {
-				granted = true
-				break
-			}
+		if k.grantsUpstream(rt.up.Name) {
+			granted = true
+			break
 		}
 	}
 	if len(routes) == 0 || !granted {
 		rs.info.outcome = "forbidden"
-		writeStaticError(&rs.rec, http.StatusForbidden, errNotUpstream)
+		writeStaticError(&rs.rec, http.StatusForbidden, notAnUpstream.body)
 		return
 	}
-	rs.ev.Upstream = routes[0].up.Name
-	if st.ca == nil {
+	if len(routes) == 1 {
+		rs.ev.Upstream = routes[0].up.Name
+	}
+	if !st.ca.validAt(g.now()) {
 		rs.info.outcome = "upstream_unconfigured"
 		writeStaticError(&rs.rec, http.StatusServiceUnavailable, errProxyTLSOff)
 		return
@@ -308,7 +333,7 @@ func (g *Gateway) serveConnect(w http.ResponseWriter, r *http.Request) {
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, ir *http.Request) {
 			rs := &reqState{rec: statusRecorder{ResponseWriter: w, status: http.StatusOK}, start: g.now()}
 			rs.state = g.state.Load()
-			rs.info.presentedKey = tunnelKeyValue
+			rs.tunnelKey = tunnelKeyValue
 			if ir.Host != "" && originKey("https", ir.Host) != originKey("https", authority) ||
 				ir.URL.IsAbs() && (ir.URL.Scheme != "https" || originKey("https", ir.URL.Host) != originKey("https", authority)) {
 				rs.ev = Event{Method: ir.Method, Proxy: true}
@@ -416,6 +441,10 @@ type proxyCA struct {
 
 const leafValidity = 7 * 24 * time.Hour
 
+func (ca *proxyCA) validAt(now time.Time) bool {
+	return ca != nil && !now.Before(ca.cert.NotBefore) && now.Before(ca.cert.NotAfter)
+}
+
 func loadProxyCA(certFile, keyFile string) (*proxyCA, error) {
 	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
@@ -444,10 +473,14 @@ func loadProxyCA(certFile, keyFile string) (*proxyCA, error) {
 }
 
 func (ca *proxyCA) leaf(host string, now time.Time) (*tls.Certificate, error) {
+	if !ca.validAt(now) {
+		return nil, errors.New("the proxy CA certificate is not currently valid")
+	}
 	host = strings.ToLower(strings.Trim(host, "[]"))
 	ca.mu.Lock()
 	defer ca.mu.Unlock()
-	if c := ca.cache[host]; c != nil && now.Add(time.Hour).Before(c.Leaf.NotAfter) {
+	if c := ca.cache[host]; c != nil && !now.Before(c.Leaf.NotBefore) &&
+		(now.Add(time.Hour).Before(c.Leaf.NotAfter) || c.Leaf.NotAfter.Equal(ca.cert.NotAfter)) {
 		return c, nil
 	}
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127))

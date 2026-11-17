@@ -360,7 +360,13 @@ func (g *Gateway) sharedTransport(timeout time.Duration, eg egress) *http.Transp
 	if t := g.transports[tk]; t != nil {
 		return t
 	}
-	t := &http.Transport{
+	t := newTransport(timeout, eg)
+	g.transports[tk] = t
+	return t
+}
+
+func newTransport(timeout time.Duration, eg egress) *http.Transport {
+	return &http.Transport{
 		Proxy:                 eg.proxy,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
@@ -371,13 +377,11 @@ func (g *Gateway) sharedTransport(timeout time.Duration, eg egress) *http.Transp
 		IdleConnTimeout:       90 * time.Second,
 		ForceAttemptHTTP2:     true,
 	}
-	g.transports[tk] = t
-	return t
 }
 
-// lookupKey finds the runtime key for a presented virtual key. Keys are
-// indexed by their SHA-256, so lookup time does not depend on how much of a
-// guessed key matches; the final comparison is constant time as well.
+// lookupKey finds the runtime key for a presented virtual key. Basic Auth
+// carries the key in its password field, but generated keys have 256 bits of
+// randomness. The digest indexes the key without storing it in plaintext.
 func (st *runtimeState) lookupKey(presented string) *runtimeKey {
 	sum := sha256.Sum256([]byte(presented))
 	rk := st.keys[sum]
@@ -410,11 +414,10 @@ func generate(prefix string) (key, hash string, err error) {
 type ctxKey struct{}
 
 type requestInfo struct {
-	rest         string
-	outcome      string
-	proxied      bool   // forward-proxy request: keep absolute redirects as they are
-	presentedKey string // request-scoped, used only to redact the audit path
-	route        *route
+	rest    string
+	outcome string
+	proxied bool // forward-proxy request: keep absolute redirects as they are
+	route   *route
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -449,18 +452,25 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // reqState groups the per-request bookkeeping into a single allocation.
 type reqState struct {
-	rec   statusRecorder
-	info  requestInfo
-	ev    Event
-	start time.Time
-	state *runtimeState // credential snapshot used when recording rejected requests
+	rec       statusRecorder
+	info      requestInfo
+	ev        Event
+	start     time.Time
+	state     *runtimeState // credential snapshot used when recording rejected requests
+	tunnelKey string        // the outer CONNECT credential is absent from inner request headers
 }
 
 func (g *Gateway) finish(r *http.Request, rs *reqState) {
 	ev := &rs.ev
+	keyID := ev.Key // counters belong to the configured key, even if its display label is redacted
 	rt := rs.info.route
-	for _, field := range []*string{&ev.Path, &ev.Method} {
-		secret := rs.info.presentedKey != "" && containsSensitiveValue(*field, []string{rs.info.presentedKey})
+	var scratch [6]string
+	keys, complete := auditCredentials(r.Header, rs.tunnelKey, scratch[:0])
+	for _, field := range []*string{&ev.Path, &ev.Method, &ev.Key, &ev.Upstream} {
+		if *field == "" {
+			continue
+		}
+		secret := !complete || containsSensitiveValue(*field, keys)
 		if rs.state != nil {
 			// A request can echo a different upstream's credential, and an
 			// ambiguous path may not identify any route. Check the original
@@ -477,7 +487,7 @@ func (g *Gateway) finish(r *http.Request, rs *reqState) {
 	ev.Status = rs.rec.status
 	ev.Outcome = rs.info.outcome
 	ev.DurationMS = g.now().Sub(rs.start).Milliseconds()
-	g.events.add(*ev)
+	g.events.record(*ev, keyID)
 	if g.log.Enabled(r.Context(), slog.LevelInfo) {
 		g.log.LogAttrs(r.Context(), slog.LevelInfo, "request",
 			slog.String("key", ev.Key), slog.String("upstream", ev.Upstream), slog.String("method", ev.Method),
@@ -516,7 +526,6 @@ func (g *Gateway) validKey(st *runtimeState, presented string) (k *runtimeKey, o
 // authenticate checks the presented key and writes the rejection itself.
 // Proxy requests are challenged with 407 so clients send proxy credentials.
 func (g *Gateway) authenticate(rs *reqState, st *runtimeState, presented string, proxy bool) *runtimeKey {
-	rs.info.presentedKey = presented
 	rec, info := &rs.rec, &rs.info
 	status, challenge := http.StatusUnauthorized, "WWW-Authenticate"
 	if proxy {
@@ -555,8 +564,11 @@ func (g *Gateway) authenticate(rs *reqState, st *runtimeState, presented string,
 // reach the upstream.
 func (g *Gateway) forward(rs *reqState, r *http.Request, st *runtimeState, k *runtimeKey, name, rest string) {
 	rec, info, ev := &rs.rec, &rs.info, &rs.ev
-	ev.Upstream = name
 	rt := st.upstreams[name]
+	if rt != nil {
+		// The route name in a request is untrusted until it matches config.
+		ev.Upstream = rt.up.Name
+	}
 	info.route = rt
 	if rt == nil || !k.allows(name, r.Method, rest) {
 		info.outcome = "forbidden"
@@ -622,15 +634,16 @@ func (g *Gateway) Explain(keyID, method, path string) Decision {
 		if u.Scheme != "http" && u.Scheme != "https" {
 			return Decision{Outcome: "bad_path", Reason: "the proxy target must be an http(s) URL"}
 		}
-		var ok bool
-		name, rest, ok = st.matchOrigin(u.Scheme, u.Host, u.EscapedPath())
 		switch {
 		case checkPath(orRoot(u.EscapedPath())) != nil:
 			return Decision{Outcome: "bad_path", Reason: "the path contains dot segments, // or encoded separators"}
 		case checkQuery(u.RawQuery) != nil:
 			return Decision{Outcome: "bad_query", Reason: "the query contains a malformed percent escape or an unescaped semicolon"}
-		case !ok:
-			return Decision{Outcome: "forbidden", Reason: "no upstream has this origin and base path"}
+		}
+		var problem *originError
+		name, rest, problem = st.matchOrigin(rk, u.Scheme, u.Host, u.EscapedPath())
+		if problem != nil {
+			return problem.decision
 		}
 	} else {
 		name, rest, err = splitRoute(u.EscapedPath())
@@ -643,7 +656,7 @@ func (g *Gateway) Explain(keyID, method, path string) Decision {
 	}
 	rt := st.upstreams[name]
 	if rt == nil {
-		return Decision{Outcome: "forbidden", Reason: fmt.Sprintf("there is no upstream named %q", name)}
+		return Decision{Outcome: "forbidden", Reason: "no upstream is configured for this route prefix"}
 	}
 	// Use the same compiled grants as ServeHTTP so explanations never
 	// diverge from enforcement.
@@ -653,10 +666,10 @@ func (g *Gateway) Explain(keyID, method, path string) Decision {
 			if rt.err != nil {
 				return Decision{Outcome: "upstream_unconfigured", Reason: "allowed, but the upstream credential is unavailable: " + rt.err.Error(), Grant: gr}
 			}
-			return Decision{Allowed: true, Outcome: "forwarded", Reason: fmt.Sprintf("would forward to %s%s", rt.up.base.String(), rest), Grant: gr}
+			return Decision{Allowed: true, Outcome: "forwarded", Reason: "the method and path match a grant for /" + rt.up.Name, Grant: gr}
 		}
 	}
-	return Decision{Outcome: "forbidden", Reason: fmt.Sprintf("no grant allows %s %s on %s", method, rest, name)}
+	return Decision{Outcome: "forbidden", Reason: "no grant for /" + rt.up.Name + " allows this method and path"}
 }
 
 // allows evaluates the key's precompiled grants; default deny.
@@ -768,7 +781,11 @@ func (rt *route) modifyResponse(resp *http.Response) error {
 		resp.Header.Del("Refresh")
 		for _, h := range [...]string{"Location", "Content-Location"} {
 			if v := resp.Header.Get(h); v != "" {
-				resp.Header.Set(h, stripQueryParam(v, rt.cred.auth.Name))
+				if safe := stripQueryParam(v, rt.cred.auth.Name); safe != "" {
+					resp.Header.Set(h, safe)
+				} else {
+					resp.Header.Del(h)
+				}
 			}
 		}
 	}
@@ -904,18 +921,14 @@ func (b *sanitisedResponseBody) Close() error {
 	return err
 }
 
-// stripQueryParam removes name from the query of the URL reference v. An
-// unparsable reference that still carries the parameter is dropped entirely.
+// stripQueryParam removes name from a URL reference. Drop an ambiguous
+// reference entirely rather than returning a partially parsed query.
 func stripQueryParam(v, name string) string {
 	u, err := url.Parse(v)
-	if err != nil {
+	if err != nil || checkQuery(u.RawQuery) != nil {
 		return ""
 	}
-	q, err := url.ParseQuery(u.RawQuery)
-	if err != nil || q.Has(name) {
-		q.Del(name)
-		u.RawQuery = q.Encode()
-	}
+	u.RawQuery = replaceQueryField(u.RawQuery, name, "")
 	return u.String()
 }
 

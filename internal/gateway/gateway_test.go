@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -299,17 +300,19 @@ func TestGenerateKey(t *testing.T) {
 // implementations. The optimised versions must agree with them exactly.
 func referenceSplitRoute(escaped string) (name, rest string, err error) {
 	lower := strings.ToLower(escaped)
-	for _, bad := range []string{"%2f", "%5c", "%2e", "%3b", "%00", "\\", "//", ";"} {
+	for _, bad := range []string{"%2f", "%2e", "%25", "//"} {
 		if strings.Contains(lower, bad) {
 			return "", "", errUnsafePath
 		}
 	}
-	if !strings.HasPrefix(escaped, "/") {
+	decoded, err := url.PathUnescape(escaped)
+	if err != nil || !strings.HasPrefix(escaped, "/") || strings.ContainsAny(decoded, "\\;") ||
+		strings.ContainsFunc(decoded, func(r rune) bool { return r < ' ' || r == 0x7f }) {
 		return "", "", errUnsafePath
 	}
 	name, rest, _ = strings.Cut(strings.TrimPrefix(escaped, "/"), "/")
 	rest = "/" + rest
-	for _, seg := range strings.Split(rest, "/") {
+	for _, seg := range strings.Split(decoded, "/") {
 		if seg == "." || seg == ".." {
 			return "", "", errUnsafePath
 		}
@@ -335,6 +338,7 @@ func referenceMatchPath(pattern, path string) bool {
 }
 
 var routeSamples = []string{
+	"/items/100%25", "/items/%7f", "/items/%1f",
 	"", "/", "//", "/a", "/a/", "/a//b", "/jira/rest/api/3/issue/A-1", "/jira/.", "/jira/..", "/jira/./x",
 	"/jira/a/../b", "/jira/..a/b", "/jira/a..", "/jira/%2e%2e/x", "/jira/%2E/x", "/jira/%2F", "/jira/a%2fb",
 	"/jira/%5C", "/jira/%5c", "/jira/%00", "/jira/%0", "/jira/%2", "/jira/%", "/jira/%%2f", "/jira/%20x",
@@ -517,6 +521,29 @@ func TestEventLogRing(t *testing.T) {
 	}
 	if _, ok := stats[""]; ok {
 		t.Fatal("anonymous requests must not create key stats")
+	}
+}
+
+func TestActivityUsesConfiguredUpstreamNames(t *testing.T) {
+	var got seen
+	up := newUpstream(t, &got)
+	g, _ := testGateway(t, up.URL, nil)
+	rec := do(g, "GET", "/unconfigured/items", agentKey, nil)
+	events := g.events.since(0, 10)
+	if rec.Code != 403 || got.method != "" || len(events) != 1 || events[0].Upstream != "" {
+		t.Error("an unknown route must be denied without attributing it to an upstream")
+	}
+}
+
+func TestLastUsedDoesNotMoveBackwards(t *testing.T) {
+	l := newEventLog(2)
+	later := time.Now()
+	for _, started := range []time.Time{later, later.Add(-time.Minute)} {
+		l.add(Event{Key: "agent", Time: started, Outcome: "forwarded"})
+	}
+	stats, _, _ := l.snapshot()
+	if last := stats["agent"].LastUsed; last == nil || !last.Equal(later) {
+		t.Fatal("a slower request obscured a more recent use of the key")
 	}
 }
 

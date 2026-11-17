@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"syscall"
@@ -18,6 +19,50 @@ type credential struct {
 	secret string // unencoded secret, retained only for response sanitising
 }
 
+func basicPassword(token string) string {
+	raw, err := base64.StdEncoding.DecodeString(token)
+	if err != nil {
+		return ""
+	}
+	_, password, _ := strings.Cut(string(raw), ":")
+	return password
+}
+
+// Audit all presented credentials, even those authentication did not select.
+// With an excessive number of headers, omit the request metadata instead of
+// spending unbounded time comparing every value against every field.
+func auditCredentials(h http.Header, tunnel string, dst []string) ([]string, bool) {
+	inline, auth, proxy := h.Values("X-Hootway-Key"), h.Values("Authorization"), h.Values("Proxy-Authorization")
+	if len(inline)+len(auth)+len(proxy) > 8 {
+		return nil, false
+	}
+	if tunnel != "" {
+		dst = append(dst, tunnel)
+	}
+	for _, v := range inline {
+		if v != "" {
+			dst = append(dst, v)
+		}
+	}
+	for _, values := range [...][]string{auth, proxy} {
+		for _, v := range values {
+			scheme, token, found := strings.Cut(v, " ")
+			if !found {
+				token = v
+			}
+			if token = strings.TrimSpace(token); token != "" {
+				dst = append(dst, token)
+				if strings.EqualFold(scheme, "Basic") {
+					if password := basicPassword(token); password != "" {
+						dst = append(dst, password)
+					}
+				}
+			}
+		}
+	}
+	return dst, true
+}
+
 func resolveCredential(a Auth, getenv func(string) string) (credential, error) {
 	if a.Type == "none" {
 		return credential{auth: a}, nil
@@ -26,34 +71,39 @@ func resolveCredential(a Auth, getenv func(string) string) (credential, error) {
 	if err != nil {
 		return credential{}, err
 	}
+	// A route that cannot inject this value still needs to recognise it in
+	// audit metadata. Callers must check the error before applying c.
+	c := credential{auth: a, secret: secret}
 	switch a.Type {
 	case "bearer":
 		if !validHeaderValue(secret) {
-			return credential{}, errors.New("secret contains invalid HTTP header control bytes")
+			return c, errors.New("secret contains invalid HTTP header control bytes")
 		}
-		return credential{auth: a, value: "Bearer " + secret, secret: secret}, nil
+		c.value = "Bearer " + secret
 	case "basic":
 		user := a.Username
 		if a.UsernameEnv != "" {
 			user = getenv(a.UsernameEnv)
 			if user == "" {
-				return credential{}, fmt.Errorf("environment variable %s is empty", a.UsernameEnv)
+				return c, fmt.Errorf("environment variable %s is empty", a.UsernameEnv)
 			}
 			if strings.ContainsAny(user, ":\r\n\x00") {
-				return credential{}, fmt.Errorf("environment variable %s contains a colon or line break", a.UsernameEnv)
+				return c, fmt.Errorf("environment variable %s contains a colon or line break", a.UsernameEnv)
 			}
 		}
 		token := base64.StdEncoding.EncodeToString([]byte(user + ":" + secret))
-		return credential{auth: a, value: "Basic " + token, secret: secret}, nil
+		c.value = "Basic " + token
 	case "header":
 		if !validHeaderValue(a.Prefix + secret) {
-			return credential{}, errors.New("credential contains invalid HTTP header control bytes")
+			return c, errors.New("credential contains invalid HTTP header control bytes")
 		}
-		return credential{auth: a, value: a.Prefix + secret, secret: secret}, nil
+		c.value = a.Prefix + secret
 	case "query":
-		return credential{auth: a, value: secret, secret: secret}, nil
+		c.value = secret
+	default:
+		return c, fmt.Errorf("unknown auth type %q", a.Type)
 	}
-	return credential{}, fmt.Errorf("unknown auth type %q", a.Type)
+	return c, nil
 }
 
 func readSecret(env, file string, getenv func(string) string) (string, error) {
@@ -129,10 +179,37 @@ func (c credential) apply(r *http.Request) {
 	case "header":
 		r.Header.Set(c.auth.Name, c.value)
 	case "query":
-		q := r.URL.Query()
-		q.Set(c.auth.Name, c.value)
-		r.URL.RawQuery = q.Encode()
+		field := url.QueryEscape(c.auth.Name) + "=" + url.QueryEscape(c.value)
+		r.URL.RawQuery = replaceQueryField(r.URL.RawQuery, c.auth.Name, field)
 	}
+}
+
+// Replace all spellings of the credential name, keeping the original order
+// and bytes of unrelated fields (including bare flags and repeated keys).
+// An empty replacement removes the field from a redirect.
+func replaceQueryField(raw, name, replacement string) string {
+	if raw == "" {
+		return replacement
+	}
+	fields := strings.Split(raw, "&")
+	kept := fields[:0]
+	for _, field := range fields {
+		key, _, _ := strings.Cut(field, "=")
+		decoded, err := url.QueryUnescape(key)
+		if err != nil || decoded != name {
+			kept = append(kept, field)
+		}
+	}
+	if len(kept) == len(fields) {
+		if replacement == "" {
+			return raw
+		}
+		return raw + "&" + replacement
+	}
+	if replacement != "" {
+		kept = append(kept, replacement)
+	}
+	return strings.Join(kept, "&")
 }
 
 // isProtectedHeader reports headers that are owned by the gateway or the

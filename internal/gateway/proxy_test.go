@@ -32,11 +32,12 @@ func proxyGateway(t *testing.T, base string, ca bool, transport http.RoundTrippe
 			}
 		}
 	})
+	// The CA and the TLS client both use the wall clock. Issue test leaves
+	// on that clock as well; the policy-only tests use a fixed clock.
+	g.now = time.Now
 	if transport != nil {
 		g.transport = transport
 		g.Apply(g.Config())
-	} else {
-		g.Apply(g.Config()) // load the CA added by mutate
 	}
 	srv := httptest.NewServer(g)
 	t.Cleanup(srv.Close)
@@ -271,6 +272,29 @@ func TestHTTPSProxyWithoutCAIsRefused(t *testing.T) {
 	}
 }
 
+func TestRunningGatewayReflectsCAExpiry(t *testing.T) {
+	var got seen
+	up := httptest.NewTLSServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { got.method = r.Method }))
+	defer up.Close()
+	g, _, _ := proxyGateway(t, up.URL, true, up.Client().Transport)
+	ca := g.state.Load().ca
+	g.now = func() time.Time { return ca.cert.NotAfter }
+	a := NewAdmin(g, "", HashKey(adminToken), "http://gateway.test")
+	if a.state().(map[string]any)["proxy_https"] != false {
+		t.Error("console still advertises an expired proxy CA")
+	}
+	req := httptest.NewRequest("CONNECT", strings.TrimPrefix(up.URL, "https://"), nil)
+	req.Header.Set("Proxy-Authorization", "Bearer "+agentKey)
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, req)
+	if rec.Code != 503 || got.method != "" {
+		t.Errorf("expired CA should stop CONNECT before the tunnel opens: status %d", rec.Code)
+	}
+	if _, err := ca.leaf("localhost", g.now()); err == nil {
+		t.Error("expired CA issued a leaf certificate")
+	}
+}
+
 func TestExplainAcceptsRealUpstreamURLs(t *testing.T) {
 	g, _ := testGateway(t, "https://jira.example.com", func(c *Config) { c.Proxy = &ProxyMode{} })
 	if d := g.Explain("agent", "GET", "https://jira.example.com/jira/rest/api/3/issue/A-1"); !d.Allowed {
@@ -281,6 +305,59 @@ func TestExplainAcceptsRealUpstreamURLs(t *testing.T) {
 	}
 	if d := g.Explain("agent", "GET", "https://evil.example.com/jira/rest/api/3/issue/A-1"); d.Allowed {
 		t.Fatalf("foreign origin: %+v", d)
+	}
+}
+
+func TestProxyUsesOnlyAnUnambiguousGrantAtTheLongestBase(t *testing.T) {
+	var got seen
+	up := newUpstream(t, &got)
+	g, _ := testGateway(t, up.URL, nil)
+	cfg, err := g.Config().clone()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Proxy = &ProxyMode{}
+	second := cfg.Upstreams[0]
+	second.Name, second.Auth = "second", Auth{Type: "none"}
+	parent := second
+	parent.Name, parent.BaseURL = "parent", up.URL
+	cfg.Upstreams = append(cfg.Upstreams, second, parent)
+	const target = "/jira/status"
+	for _, tc := range []struct {
+		name    string
+		granted []string
+		want    int
+		route   string
+	}{
+		{"both identities", []string{"jira", "second"}, 403, ""},
+		{"broader base only", []string{"parent"}, 403, ""},
+		{"first identity only", []string{"jira"}, 200, "jira"},
+		{"second identity only", []string{"second"}, 200, "second"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg.Keys[0].Grants = nil
+			for _, name := range tc.granted {
+				cfg.Keys[0].Grants = append(cfg.Keys[0].Grants, Grant{Upstream: name, Methods: []string{"GET"}, Paths: []string{"/**"}})
+			}
+			next, err := cfg.clone()
+			if err != nil {
+				t.Fatal(err)
+			}
+			g.Apply(next)
+			got = seen{}
+			rec := do(g, "GET", up.URL+target, agentKey, nil)
+			d := g.Explain("agent", "GET", up.URL+target)
+			if rec.Code != tc.want || d.Allowed != (tc.want == 200) {
+				t.Errorf("proxy status %d, Check outcome %s", rec.Code, d.Outcome)
+			}
+			if tc.want == 403 {
+				if got.method != "" || rec.Code != 403 || d.Outcome != errorCode(t, rec) {
+					t.Error("a denied request must not be forwarded and must agree with Check")
+				}
+			} else if got.path != target || (got.authz != "") != (tc.route == "jira") || d.Grant == nil || d.Grant.Upstream != tc.route {
+				t.Error("the gateway did not use the selected connection")
+			}
+		})
 	}
 }
 

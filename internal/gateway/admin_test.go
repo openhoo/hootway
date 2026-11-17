@@ -22,7 +22,7 @@ type console struct {
 	client *http.Client
 }
 
-func (c *console) call(method, path string, body any, header bool) (int, map[string]any) {
+func (c *console) call(method, path string, body any, header bool, extra ...map[string]string) (int, map[string]any) {
 	c.t.Helper()
 	var r io.Reader
 	if body != nil {
@@ -32,6 +32,11 @@ func (c *console) call(method, path string, body any, header bool) (int, map[str
 	req, _ := http.NewRequest(method, c.srv.URL+path, r)
 	if header {
 		req.Header.Set("X-Hootway-Console", "1")
+	}
+	for _, fields := range extra {
+		for k, v := range fields {
+			req.Header.Set(k, v)
+		}
 	}
 	res, err := c.client.Do(req)
 	if err != nil {

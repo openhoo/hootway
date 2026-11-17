@@ -1,5 +1,14 @@
 Hootway lets agent sandboxes call logged-in APIs such as Jira with scoped virtual keys instead of real credentials.
 
+## Changes in 0.4.4
+
+- The release archives and container now build with Go 1.27.4. Source builds require Go 1.27.4 or newer; the release checks catch a mismatch between the two toolchain pins.
+- Console edits detect stale keys and upstreams. An older tab cannot undo a more recent policy or credential change. The console also confirms credential reuse on a new upstream origin and reports failed sign-outs.
+- Proxy routing distinguishes connections that share a URL using the key's grants. When more than one credential could apply, use the named gateway URL. An expired CA stops new tunnels and is reflected in console status.
+- Audit events use configured upstream names and redact credentials even when a request is rejected before authentication. Overlapping requests no longer move a key's last-used time backwards.
+- Query authentication and redirect cleanup preserve unrelated query fields byte for byte. Connection probes no longer retain separate transport pools for draft credentials.
+- `check` validates listener settings, admin credentials, endpoint ports and usable grant patterns. Non-root grants ending in `/` previously never matched and now fail validation; review the intended access before changing them. The console shows the assigned gateway port when using `:0`. Saving policy no longer persists command-line listener overrides.
+
 ## Changes in 0.4.3
 
 ### Gateway and credentials

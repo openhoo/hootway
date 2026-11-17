@@ -297,6 +297,7 @@ func TestConsoleContentNegotiationAndETagMatching(t *testing.T) {
 		{"gzip;q=0.0", false}, {"gzip;q=0.000", false}, {"gzip; q=0.5", true},
 		{"gzip;q=bogus", false}, {"gzip;q=2", false}, {"*;q=0.5", true},
 		{"*;q=1,gzip;q=0", false}, {"gzip;q=0,*;q=1", false},
+		{"identity;q=1, gzip;q=0.2", false}, {"identity;q=0.2, gzip;q=1", true},
 	} {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/app.js", nil)
